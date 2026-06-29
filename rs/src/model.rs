@@ -18,6 +18,15 @@ pub struct Run {
     /// Run đó sẽ được render thành placeholder [IMAGE] để user thấy có
     /// ảnh; khi save không dirty thì copy nguyên byte gốc giữ ảnh.
     pub is_drawing: bool,
+    /// Relationship ID của embedded media (image hoặc OLE object). Lấy từ
+    /// attribute `r:embed` (cho image trong <a:blip>) hoặc `r:id` (cho
+    /// <w:object>/<v:imagedata>). Map qua document.xml.rels để tìm file
+    /// thực trong word/media/. None nếu run không có drawing.
+    pub rel_id: Option<String>,
+    /// Byte range của run trong original XML (chỉ set cho drawing run).
+    /// Khi emit paragraph dirty, mình copy nguyên byte này thay vì tự
+    /// tái tạo XML <w:drawing> phức tạp. None cho text run thông thường.
+    pub byte_range: Option<(usize, usize)>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -54,11 +63,18 @@ pub enum ParaContext {
     /// theo độ sâu nesting (hiện chưa dùng — dự trữ cho nested table sau).
     /// `is_first_in_row` true cho paragraph đầu tiên của row mới -> render
     /// thêm dòng separator phía trên (├──┤).
+    /// `col_idx`/`row_idx`: 0-based vị trí cell trong table. `is_first_in_cell`
+    /// true cho paragraph đầu tiên của 1 cell (paragraph thứ 2+ trong cùng
+    /// cell render mà không có prefix col header).
     TableCell {
         #[allow(dead_code)]
         table_depth: u32,
         is_first_in_row: bool,
         is_last_in_row: bool,
+        col_idx: u32,
+        #[allow(dead_code)]
+        row_idx: u32,
+        is_first_in_cell: bool,
     },
     Sdt,
 }
@@ -93,4 +109,32 @@ pub struct Document {
     /// được giữ nguyên byte khi save.
     pub body_inner_range: (usize, usize),
     pub original_xml: Vec<u8>,
+    /// Byte ranges của paragraph bị xóa qua save (text editing). Khi
+    /// rebuild XML, mọi range trong đây sẽ bị SKIP (không copy byte gốc).
+    /// Field này tạm thời, được set trong apply_buffer_to_document.
+    pub deleted_ranges: Vec<(usize, usize, String)>,
+    /// Paragraph mới user insert qua Insert mode (gõ Enter trong buffer
+    /// thay vì dùng `o`). Mỗi entry: (anchor_paragraph_id, position, xml).
+    /// position = "after" (mặc định) hoặc "before". rebuild_document_xml
+    /// chèn xml NGAY TRƯỚC hoặc NGAY SAU paragraph có id anchor_paragraph_id.
+    pub pending_inserts: Vec<(String, InsertPosition, String)>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InsertPosition {
+    Before,
+    After,
+}
+
+impl ParaContext {
+    /// True nếu context là TableCell với is_first_in_cell=true.
+    pub fn is_first_in_cell_field(&self) -> bool {
+        matches!(
+            self,
+            ParaContext::TableCell {
+                is_first_in_cell: true,
+                ..
+            }
+        )
+    }
 }

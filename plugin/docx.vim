@@ -37,6 +37,9 @@ endif
 augroup DocxViewer
     autocmd!
     autocmd BufReadCmd *.docx call DocxOpen()
+    " File .docx MỚI (chưa tồn tại trên disk): Vim fire BufNewFile thay vì
+    " BufReadCmd. Tạo template DOCX trống rồi mở như bình thường.
+    autocmd BufNewFile *.docx call DocxNew()
 augroup END
 " Đảm bảo DocxOpen() được ưu tiên hơn cơ chế zip.vim của Vim (docx = zip)
 function! s:EnsureDocxOverridesZip() abort
@@ -90,6 +93,9 @@ function! DocxSetupHighlight()
     highlight DocxBorder guifg=#9ca0b0 ctermfg=245
     highlight DocxLink   guifg=#0000ff ctermfg=12 gui=underline cterm=underline
     highlight DocxHeading gui=bold cterm=bold
+    " Highlight group cho popup hover: nền tối hơn buffer, border subtle.
+    highlight default DocxHoverPopup  guibg=#2d2d3a guifg=#e0e0e0 ctermbg=237 ctermfg=255
+    highlight default DocxHoverBorder guifg=#7080a0 ctermfg=103
     " --- Viền bảng / structural markers: + | - và các box-drawing chars ---
     call matchadd('DocxBorder', '[+]', 5)
     call matchadd('DocxBorder', '[|]', 5)
@@ -115,17 +121,34 @@ endfunction
 " s:DocxHighlightGroupName(): sinh tên highlight group duy nhất, ổn định
 " theo tổ hợp (bold, italic, size_pt, color_hex).
 " ----------------------------------------------------------------------------
-function! s:DocxHighlightGroupName(bold, italic, size_pt, color_hex) abort
-    let l:key = a:bold . a:italic . '_' . a:size_pt . '_' . a:color_hex
+function! s:DocxHighlightGroupName(bold, italic, size_pt, color_hex, hl) abort
+    let l:key = a:bold . a:italic . '_' . a:size_pt . '_' . a:color_hex . '_' . a:hl
     let l:key = substitute(l:key, '[^A-Za-z0-9_]', '_', 'g')
     return 'DocxRunStyle_' . l:key
 endfunction
 " ----------------------------------------------------------------------------
-" s:DocxDefineHighlight(): định nghĩa highlight group cho 1 tổ hợp style.
-" Lưu ý: Vim không hỗ trợ font-size per-region trong cùng buffer; ta CHỈ
-" hiển thị bold/italic/color, ignore size (chỉ giữ trong file thật khi save).
+" Bộ màu Word highlight chuẩn -> hex RGB cho `guibg`. Dùng để vẽ background
+" trong Vim cho run có <w:highlight>.
 " ----------------------------------------------------------------------------
-function! s:DocxDefineHighlight(group, bold, italic, color_hex) abort
+let s:docx_highlight_hex = {
+            \ 'yellow':      'FFFF00',
+            \ 'green':       '00FF00',
+            \ 'cyan':        '00FFFF',
+            \ 'magenta':     'FF00FF',
+            \ 'blue':        '0000FF',
+            \ 'red':         'FF0000',
+            \ 'darkBlue':    '000080',
+            \ 'darkCyan':    '008080',
+            \ 'darkGreen':   '008000',
+            \ 'darkMagenta': '800080',
+            \ 'darkRed':     '800000',
+            \ 'darkYellow':  '808000',
+            \ 'darkGray':    '808080',
+            \ 'lightGray':   'C0C0C0',
+            \ 'black':       '000000',
+            \ 'white':       'FFFFFF',
+            \ }
+function! s:DocxDefineHighlight(group, bold, italic, color_hex, hl) abort
     let l:attrs = []
     if a:bold
         call add(l:attrs, 'bold')
@@ -134,10 +157,23 @@ function! s:DocxDefineHighlight(group, bold, italic, color_hex) abort
         call add(l:attrs, 'italic')
     endif
     let l:gui_attr = empty(l:attrs) ? 'NONE' : join(l:attrs, ',')
-    let l:cmd = 'highlight ' . a:group . ' gui=' . l:gui_attr . ' cterm=' . l:gui_attr
+    " term=, cterm=, gui= cùng giá trị để cover mọi loại terminal (tty,
+    " xterm-256, gVim, Neovim GUI). Một số terminal chỉ honor term= cho
+    " bold, không read cterm=.
+    let l:cmd = 'highlight ' . a:group
+                \ . ' term=' . l:gui_attr
+                \ . ' cterm=' . l:gui_attr
+                \ . ' gui=' . l:gui_attr
     if a:color_hex !=# '-'
         let l:cmd .= ' guifg=#' . a:color_hex
         let l:cmd .= ' ctermfg=' . s:DocxHexToCterm(a:color_hex)
+    endif
+    if a:hl !=# '-'
+        let l:bg_hex = get(s:docx_highlight_hex, a:hl, '')
+        if !empty(l:bg_hex)
+            let l:cmd .= ' guibg=#' . l:bg_hex
+            let l:cmd .= ' ctermbg=' . s:DocxHexToCterm(l:bg_hex)
+        endif
     endif
     execute l:cmd
 endfunction
@@ -170,7 +206,7 @@ function! s:DocxApplyCellStyles() abort
         return
     endif
     for l:item in b:docx_style_meta
-        let [l:line, l:char_start, l:char_end, l:bold, l:italic, l:size_pt, l:color_hex, l:font] = l:item
+        let [l:line, l:char_start, l:char_end, l:bold, l:italic, l:size_pt, l:color_hex, l:font, l:hl] = l:item
         if l:line < 1 || l:line > line('$')
             continue
         endif
@@ -184,9 +220,9 @@ function! s:DocxApplyCellStyles() abort
         if l:byte_len <= 0
             continue
         endif
-        let l:group = s:DocxHighlightGroupName(l:bold, l:italic, l:size_pt, l:color_hex)
+        let l:group = s:DocxHighlightGroupName(l:bold, l:italic, l:size_pt, l:color_hex, l:hl)
         if !get(s:docx_hl_defined, l:group, 0)
-            call s:DocxDefineHighlight(l:group, l:bold, l:italic, l:color_hex)
+            call s:DocxDefineHighlight(l:group, l:bold, l:italic, l:color_hex, l:hl)
             let s:docx_hl_defined[l:group] = 1
         endif
         call matchaddpos(l:group, [[l:line, l:byte_start + 1, l:byte_len]], 50)
@@ -206,12 +242,24 @@ function! s:DocxParaIdAtLine(line) abort
     if !exists('b:docx_para_map') || empty(b:docx_para_map)
         return ''
     endif
+    " Exact match
     for l:item in b:docx_para_map
         if l:item[0] == a:line
             return l:item[1]
         endif
     endfor
-    return ''
+    " Fallback: paragraph gần nhất phía TRÊN (dòng border / dòng marker
+    " không có paramap entry → vẫn cho phép `o`/`O` trên đó, anchor tới
+    " paragraph ngay trên).
+    let l:best_line = -1
+    let l:best_pid = ''
+    for l:item in b:docx_para_map
+        if l:item[0] < a:line && l:item[0] > l:best_line
+            let l:best_line = l:item[0]
+            let l:best_pid = l:item[1]
+        endif
+    endfor
+    return l:best_pid
 endfunction
 " ----------------------------------------------------------------------------
 " s:DocxParaIdAtCursor(): trả về paragraph_id tại dòng cursor hiện tại.
@@ -318,12 +366,17 @@ function! s:DocxParseMeta(output) abort
             continue
         endif
         let l:parts = split(l:raw, "\t")
-        " Format mới (8 trường): line, cs, ce, bold, italic, size_pt, color, font
-        " Format cũ (7 trường): không có font -> backward compat.
+        " Format mới (9 trường): line, cs, ce, bold, italic, size_pt, color,
+        " font, highlight. Hỗ trợ backward compat 7/8 trường.
         if len(l:parts) == 7
             let l:font = '-'
+            let l:hl = '-'
         elseif len(l:parts) == 8
             let l:font = l:parts[7]
+            let l:hl = '-'
+        elseif len(l:parts) == 9
+            let l:font = l:parts[7]
+            let l:hl = l:parts[8]
         else
             continue
         endif
@@ -337,6 +390,7 @@ function! s:DocxParseMeta(output) abort
                 \ l:size_pt,
                 \ l:parts[6],
                 \ l:font,
+                \ l:hl,
                 \ ])
     endfor
 
@@ -383,6 +437,9 @@ function! s:DocxParseMeta(output) abort
                 call add(l:listinfo, [str2nr(l:parts[0]), str2nr(l:parts[1])])
             endfor
         endif
+
+        " @@CELLMAP@@ block: parse được nhưng Vim chưa dùng (save logic
+        " xử lý bên Rust). Skip để không gây lỗi.
     endif
 
     " Bỏ dòng trống cuối content (Rust println! thêm 1 trailing newline)
@@ -414,6 +471,9 @@ endfunction
 " và lưu lại b:docx_style_meta / b:docx_para_map cho highlight + para lookup.
 " ----------------------------------------------------------------------------
 function! s:DocxLoadIntoBuffer(raw_output) abort
+    " Lưu cursor + viewport TRƯỚC khi reload để tránh nháy/mất vị trí.
+    let l:save_pos = exists('b:docx_buffer') ? getpos('.') : [0, 1, 1, 0]
+    let l:save_topline = exists('b:docx_buffer') ? line('w0') : 1
     let [l:content_lines, l:styles, l:paramap, l:listinfo] = s:DocxParseMeta(a:raw_output)
     let b:docx_style_meta = l:styles
     let b:docx_para_map = l:paramap
@@ -422,6 +482,18 @@ function! s:DocxLoadIntoBuffer(raw_output) abort
     silent %delete _
     call setline(1, l:content_lines)
     call DocxSetupHighlight()
+    " Restore cursor + viewport (clamp về số dòng buffer mới nếu cần)
+    let l:max_line = line('$')
+    if l:save_pos[1] > l:max_line
+        let l:save_pos[1] = l:max_line
+    endif
+    call setpos('.', l:save_pos)
+    " Restore topline để viewport không nhảy
+    if l:save_topline > 0 && l:save_topline <= l:max_line
+        execute 'normal! ' . l:save_topline . 'zt'
+        " Cursor có thể bị move sau zt, set lại
+        call setpos('.', l:save_pos)
+    endif
     call s:DocxUpdateStatusPara()
 endfunction
 " ----------------------------------------------------------------------------
@@ -443,6 +515,22 @@ function! DocxStatusLine() abort
     let l:pid = get(b:, 'docx_status_para', '')
     return empty(l:pid) ? '(border/outside)' : l:pid
 endfunction
+
+" ----------------------------------------------------------------------------
+" Kiểm tra đã có Excel plugin hay chưa
+" ----------------------------------------------------------------------------
+function! s:DocxHasXlsxPlugin() abort
+    return exists('*ExcelOpen') ||
+          \ exists(':ExcelOpen') == 2 ||
+          \ exists('g:loaded_excelPlugin')
+endfunction
+
+" ----------------------------------------------------------------------------
+" Kiểm tra file Excel
+" ----------------------------------------------------------------------------
+function! s:DocxIsExcelFile(path) abort
+    return a:path =~? '\.\(xlsx\|xlsm\|xls\)$'
+endfunction
 " ----------------------------------------------------------------------------
 " DocxGoto(ref): nhảy con trỏ đến paragraph có id `ref` (vd "P3").
 " ----------------------------------------------------------------------------
@@ -461,8 +549,7 @@ function! DocxGoto(ref) abort
     echoerr 'Paragraph not found: ' . a:ref
 endfunction
 " ----------------------------------------------------------------------------
-" DocxGotoComplete(): Tab completion cho :DocxGoto, liệt kê toàn bộ paragraph
-" id khả dụng (P0, P1, ...).
+" DocxGotoComplete(): Tab completion cho :DocxGoto, liệt kê toàn bộ paragraph id khả dụng (P0, P1, ...).
 " ----------------------------------------------------------------------------
 function! DocxGotoComplete(A, L, P) abort
     if !exists('b:docx_para_map')
@@ -502,6 +589,79 @@ function! DocxBuild() abort
     echo 'Build success: ' . s:docx_bin
 endfunction
 " ----------------------------------------------------------------------------
+" DocxNew(): tạo file .docx MỚI (chưa tồn tại) — gọi binary `create` để
+" sinh template DOCX trống, rồi mở như bình thường. Dùng cho BufNewFile.
+" ----------------------------------------------------------------------------
+function! DocxNew() abort
+    if exists('b:docx_buffer')
+        return
+    endif
+    if !s:EnsureBuilt()
+        echoerr 'Build failed'
+        return
+    endif
+    let l:file = expand('<amatch>')
+    if empty(l:file)
+        let l:file = expand('%:p')
+    endif
+    let b:docx_file = fnamemodify(l:file, ':p')
+    " Tạo template DOCX trống tại path qua binary `create`. Binary cũng
+    " emit luôn output 'open' (text + metadata) để load thẳng vào buffer.
+    let l:output = s:DocxCmd('create')
+    if v:shell_error
+        echoerr join(l:output, "\n")
+        return
+    endif
+    let b:docx_buffer = 1
+    call s:DocxLoadIntoBuffer(l:output)
+    call s:DocxSetupBufferOptions()
+    set nomodified
+endfunction
+" ----------------------------------------------------------------------------
+" s:DocxSetupBufferOptions(): thiết lập options + autocmd + mapping cho
+" buffer DOCX. Tách riêng để DocxOpen() và DocxNew() cùng dùng.
+" ----------------------------------------------------------------------------
+function! s:DocxSetupBufferOptions() abort
+    " Thiết lập buffer giống Excel plugin:
+    " - buftype=acwrite: ghi qua BufWriteCmd
+    " - bufhidden=hide: ẩn khi đóng tab
+    " - noswapfile: không tạo swap (buffer "ảo")
+    " - filetype=docx: cho highlight/ftplugin riêng
+    setlocal buftype=acwrite
+    setlocal bufhidden=hide
+    setlocal noswapfile
+    setlocal filetype=docx
+    " Statusline: hiển thị paragraph_id tại cursor + tên file.
+    " Thông tin KHÔNG nằm trong buffer text -> yank/copy an toàn.
+    setlocal statusline=%{DocxStatusLine()}\ —\ %f%=%l,%c\ \ %P
+    augroup DocxBuffer
+        autocmd! * <buffer>
+        autocmd BufWriteCmd <buffer> call DocxSave()
+        autocmd CursorMoved,CursorMovedI <buffer> call s:DocxUpdateStatusPara()
+        " Khi cursor di chuyển: đóng popup hover (nếu đang mở). Mở lại
+        " sau khi idle (CursorHold).
+        autocmd CursorMoved,CursorMovedI,BufLeave,WinLeave <buffer> call s:DocxClosePopup()
+        " CursorHold: sau khi cursor idle 'updatetime' ms, hiển thị popup
+        " với thông tin font/size/bold/italic/color/highlight.
+        autocmd CursorHold <buffer> call DocxHoverInfo()
+    augroup END
+    " Mapping Tab / Shift-Tab cho indent (local-to-buffer):
+    nnoremap <silent> <buffer> <Tab>   :call DocxSmartTab('+1', line('.'), line('.'))<CR>
+    nnoremap <silent> <buffer> <S-Tab> :call DocxSmartTab('-1', line('.'), line('.'))<CR>
+    xnoremap <silent> <buffer> <Tab>   :<C-u>call DocxSmartTab('+1', line("'<"), line("'>"))<CR>
+    xnoremap <silent> <buffer> <S-Tab> :<C-u>call DocxSmartTab('-1', line("'<"), line("'>"))<CR>
+    " `o` Normal mode: chèn paragraph mới ngay SAU dòng hiện tại + vào
+    " Insert mode. Kế thừa pStyle/numPr/indent/alignment + style run đầu
+    " (bold/italic/font/color) của paragraph nguồn.
+    nnoremap <silent> <buffer> o :call DocxListAdd()<CR>
+    " `O` (Shift-O) Normal mode: chèn paragraph mới ngay TRƯỚC dòng hiện
+    " tại. Kế thừa cùng cách như `o`.
+    nnoremap <silent> <buffer> O :call DocxListAddBefore()<CR>
+    " `gx` Normal mode: nếu cursor trên paragraph chứa [IMAGE] / OLE
+    " object → extract media ra /tmp/ và mở bằng app mặc định OS.
+    nnoremap <silent> <buffer> gx :call DocxOpenMedia()<CR>
+endfunction
+" ----------------------------------------------------------------------------
 " DocxOpen(): đọc file .docx qua binary, hiển thị nội dung text trong buffer
 " ----------------------------------------------------------------------------
 function! DocxOpen()
@@ -525,45 +685,29 @@ function! DocxOpen()
     endif
     let l:output = s:DocxCmd('open')
     if v:shell_error
-        echoerr join(l:output, "\n")
+        " File tồn tại nhưng KHÔNG phải DOCX zip hợp lệ (vd file rỗng do
+        " `vim newfile.docx` tạo, hoặc plain text với đuôi .docx). Thử
+        " tạo lại template DOCX trống rồi mở.
+        let l:joined = join(l:output, ' ')
+        if l:joined =~? 'zip\|central directory\|not a zip\|invalid'
+            let l:recreate = s:DocxCmd('create')
+            if v:shell_error
+                echoerr join(l:recreate, "\n")
+                unlet! b:docx_buffer
+                return
+            endif
+            call s:DocxLoadIntoBuffer(l:recreate)
+            call s:DocxSetupBufferOptions()
+            set nomodified
+            echo 'Created new blank DOCX (file was not a valid .docx)'
+            return
+        endif
+        echoerr l:joined
         unlet! b:docx_buffer
         return
     endif
     call s:DocxLoadIntoBuffer(l:output)
-    " Thiết lập buffer giống Excel plugin:
-    " - buftype=acwrite: ghi qua BufWriteCmd
-    " - bufhidden=hide: ẩn khi đóng tab
-    " - noswapfile: không tạo swap (buffer "ảo")
-    " - filetype=docx: cho highlight/ftplugin riêng
-    setlocal buftype=acwrite
-    setlocal bufhidden=hide
-    setlocal noswapfile
-    setlocal filetype=docx
-    " Statusline: hiển thị paragraph_id tại cursor + tên file.
-    " Thông tin KHÔNG nằm trong buffer text -> yank/copy an toàn.
-    setlocal statusline=%{DocxStatusLine()}\ —\ %f%=%l,%c\ \ %P
-    augroup DocxBuffer
-        autocmd! * <buffer>
-        autocmd BufWriteCmd <buffer> call DocxSave()
-        autocmd CursorMoved,CursorMovedI <buffer> call s:DocxUpdateStatusPara()
-        " CursorHold: sau khi cursor idle 'updatetime' ms, hiển thị thông
-        " tin font/size/bold/italic/color của vùng tại cursor qua echo.
-        " Mặc định updatetime = 4000ms; user có thể set thấp hơn (vd 500)
-        " trong .vimrc nếu muốn hover nhanh hơn.
-        autocmd CursorHold <buffer> call DocxHoverInfo()
-    augroup END
-    " Mapping Tab / Shift-Tab cho indent (local-to-buffer):
-    " - Trên list item: tăng/giảm ilvl (1.1 -> 1.1.1 hoặc ngược lại)
-    " - Trên paragraph thường: tăng/giảm indent
-    nnoremap <silent> <buffer> <Tab>   :call DocxSmartTab('+1', line('.'), line('.'))<CR>
-    nnoremap <silent> <buffer> <S-Tab> :call DocxSmartTab('-1', line('.'), line('.'))<CR>
-    xnoremap <silent> <buffer> <Tab>   :<C-u>call DocxSmartTab('+1', line("'<"), line("'>"))<CR>
-    xnoremap <silent> <buffer> <S-Tab> :<C-u>call DocxSmartTab('-1', line("'<"), line("'>"))<CR>
-    " `o` Normal mode: chèn paragraph mới ngay sau dòng hiện tại + vào
-    " Insert mode. Nếu trên list item -> kế thừa numId + ilvl.
-    nnoremap <silent> <buffer> o :call DocxListAdd()<CR>
-    " :DocxListDel để xoá paragraph hiện tại — không map dd để tránh
-    " conflict với behavior text editing thông thường.
+    call s:DocxSetupBufferOptions()
     set nomodified
 endfunction
 " ----------------------------------------------------------------------------
@@ -573,18 +717,15 @@ endfunction
 function! DocxSave()
     let l:tmp = tempname()
     call writefile(getline(1, '$'), l:tmp)
+    " Binary save giờ emit luôn output 'open' sau khi save -> không cần
+    " gọi binary lần 2.
     let l:result = s:DocxCmd('save', l:tmp)
     call delete(l:tmp)
     if v:shell_error
         echoerr join(l:result, "\n")
         return
     endif
-    let l:output = s:DocxCmd('open')
-    if v:shell_error
-        echoerr join(l:output, "\n")
-        return
-    endif
-    call s:DocxLoadIntoBuffer(l:output)
+    call s:DocxLoadIntoBuffer(l:result)
     set nomodified
     echo 'DOCX saved & reformatted'
 endfunction
@@ -605,17 +746,14 @@ function! s:DocxRunStyleCmd(attr, para_ids, value) abort
         return 0
     endif
     let l:joined = join(a:para_ids, ',')
+    " Binary setstyle giờ emit luôn output 'open' sau khi save -> không
+    " cần gọi binary lần 2. Tiết kiệm ~50% thời gian / style command.
     let l:result = s:DocxCmd('setstyle', l:joined, a:attr, a:value)
     if v:shell_error
         echoerr join(l:result, "\n")
         return 0
     endif
-    let l:output = s:DocxCmd('open')
-    if v:shell_error
-        echoerr join(l:output, "\n")
-        return 0
-    endif
-    call s:DocxLoadIntoBuffer(l:output)
+    call s:DocxLoadIntoBuffer(l:result)
     set nomodified
     return 1
 endfunction
@@ -757,56 +895,223 @@ function! DocxHighlight(color, line1, line2) abort
     endif
 endfunction
 " ----------------------------------------------------------------------------
-" DocxHoverInfo(): hiển thị thông tin style tại con trỏ qua thanh echo.
-" Tìm trong b:docx_style_meta entry phủ vị trí cursor và in font + size +
-" bold/italic + color. Gọi qua CursorHold autocmd (sau 'updatetime' ms idle)
-" hoặc qua :DocxInfo.
+" DocxHoverInfo(): hiển thị thông tin style tại con trỏ trong 1 popup nhỏ
+" cạnh cursor (nếu Vim/Neovim hỗ trợ), fallback về echo nếu không.
 " ----------------------------------------------------------------------------
-function! DocxHoverInfo() abort
+let s:docx_popup_id = 0
+function! s:DocxClosePopup() abort
+    if has('nvim')
+        if s:docx_popup_id != 0
+            silent! call nvim_win_close(s:docx_popup_id, 1)
+            let s:docx_popup_id = 0
+        endif
+    else
+        if s:docx_popup_id != 0
+            silent! call popup_close(s:docx_popup_id)
+            let s:docx_popup_id = 0
+        endif
+    endif
+endfunction
+" ----------------------------------------------------------------------------
+" s:DocxBuildHoverText(): build danh sách dòng text mô tả style tại cursor.
+" Trả về [] nếu không có gì để hiện.
+" ----------------------------------------------------------------------------
+function! s:DocxBuildHoverText() abort
     if !exists('b:docx_style_meta')
-        return
+        return []
     endif
     let l:line = line('.')
     let l:vcol = virtcol('.')
     let l:found = []
     for l:item in b:docx_style_meta
-        let [l:ln, l:cs, l:ce, l:bold, l:italic, l:size, l:color, l:font] = l:item
+        let [l:ln, l:cs, l:ce, l:bold, l:italic, l:size, l:color, l:font, l:hl] = l:item
         if l:ln == l:line && l:vcol >= l:cs && l:vcol <= l:ce
             let l:found = l:item
             break
         endif
     endfor
     let l:pid = s:DocxParaIdAtCursor()
-    let l:msg = empty(l:pid) ? '' : l:pid . ' | '
-    if empty(l:found)
-        let l:msg .= 'default style'
-    else
-        let l:parts = []
-        if l:found[7] !=# '-'
-            call add(l:parts, 'font=' . l:found[7])
-        endif
-        if l:found[5] !=# '-'
-            call add(l:parts, 'size=' . l:found[5] . 'pt')
-        endif
-        if l:found[3]
-            call add(l:parts, 'bold')
-        endif
-        if l:found[4]
-            call add(l:parts, 'italic')
-        endif
-        if l:found[6] !=# '-'
-            call add(l:parts, 'color=#' . l:found[6])
-        endif
-        let l:msg .= empty(l:parts) ? 'default style' : join(l:parts, ' ')
+    let l:lines = []
+    if !empty(l:pid)
+        call add(l:lines, '◆ ' . l:pid)
     endif
-    " Dùng echo (không echoerr) để không stack vào messages history.
-    echo l:msg
+    if empty(l:found)
+        call add(l:lines, '(default style)')
+        return l:lines
+    endif
+    if l:found[7] !=# '-'
+        call add(l:lines, 'Font:  ' . l:found[7])
+    endif
+    if l:found[5] !=# '-'
+        call add(l:lines, 'Size:  ' . l:found[5] . ' pt')
+    endif
+    let l:attrs = []
+    if l:found[3]
+        call add(l:attrs, 'Bold')
+    endif
+    if l:found[4]
+        call add(l:attrs, 'Italic')
+    endif
+    if !empty(l:attrs)
+        call add(l:lines, 'Style: ' . join(l:attrs, ', '))
+    endif
+    if l:found[6] !=# '-'
+        call add(l:lines, 'Color: #' . l:found[6])
+    endif
+    if l:found[8] !=# '-'
+        call add(l:lines, 'BG:    ' . l:found[8])
+    endif
+    return l:lines
+endfunction
+" ----------------------------------------------------------------------------
+" DocxHoverInfo(): main entry — gọi từ CursorHold autocmd hoặc :DocxInfo.
+" ----------------------------------------------------------------------------
+function! DocxHoverInfo() abort
+    call s:DocxClosePopup()
+    let l:lines = s:DocxBuildHoverText()
+    if empty(l:lines)
+        return
+    endif
+
+    if has('nvim')
+        let l:buf = nvim_create_buf(v:false, v:true)
+        call nvim_buf_set_lines(l:buf, 0, -1, v:true, l:lines)
+        let l:width = 10
+        for l:l in l:lines
+            if strdisplaywidth(l:l) > l:width
+                let l:width = strdisplaywidth(l:l)
+            endif
+        endfor
+        let l:opts = {
+                    \ 'relative': 'cursor',
+                    \ 'row': 1,
+                    \ 'col': 1,
+                    \ 'width': l:width + 2,
+                    \ 'height': len(l:lines),
+                    \ 'style': 'minimal',
+                    \ 'border': 'rounded',
+                    \ 'focusable': v:false,
+                    \ }
+        let s:docx_popup_id = nvim_open_win(l:buf, v:false, l:opts)
+        call nvim_win_set_option(s:docx_popup_id, 'winhl', 'Normal:DocxHoverPopup,FloatBorder:DocxHoverBorder')
+    elseif exists('*popup_create')
+        let l:opts = {
+                    \ 'pos': 'topleft',
+                    \ 'line': 'cursor+1',
+                    \ 'col': 'cursor+1',
+                    \ 'border': [1, 1, 1, 1],
+                    \ 'padding': [0, 1, 0, 1],
+                    \ 'highlight': 'DocxHoverPopup',
+                    \ 'borderhighlight': ['DocxHoverBorder'],
+                    \ 'moved': 'any',
+                    \ 'close': 'click',
+                    \ }
+        let s:docx_popup_id = popup_create(l:lines, l:opts)
+    else
+        echo join(l:lines, ' | ')
+    endif
+endfunction
+" ----------------------------------------------------------------------------
+" MEDIA / ATTACHMENT - mở image, OLE object bằng app mặc định OS
+" ----------------------------------------------------------------------------
+function! s:DocxSystemOpenCmd() abort
+    if has('mac') || has('macunix')
+        return 'open'
+    elseif has('win32') || has('win64')
+        return 'cmd /c start ""'
+    else
+        return 'xdg-open'
+    endif
+endfunction
+function! s:DocxIsImageFile(path) abort
+    return a:path =~? '\.\(png\|jpg\|jpeg\|gif\|webp\|bmp\|tiff\|tif\)$'
+endfunction
+function! s:DocxTermImageCmd(path) abort
+    let l:p = shellescape(a:path)
+    let l:term_prog = $TERM_PROGRAM
+    let l:term = $TERM
+    if l:term_prog ==# 'iTerm.app' && executable('imgcat')
+        return 'imgcat ' . l:p
+    endif
+    if l:term_prog ==# 'WezTerm' && executable('wezterm')
+        return 'wezterm imgcat ' . l:p
+    endif
+    if (l:term =~? 'kitty' || l:term_prog ==# 'ghostty' || l:term_prog ==# 'WezTerm')
+                \ && executable('kitten')
+        return 'kitten icat ' . l:p
+    endif
+    if l:term =~? 'kitty' && executable('kitty')
+        return 'kitty +kitten icat ' . l:p
+    endif
+    if executable('img2sixel') && (l:term =~? 'sixel\|foot\|mlterm\|wezterm\|xterm-direct')
+        return 'img2sixel ' . l:p
+    endif
+    if executable('chafa')
+        return 'chafa --format=symbols ' . l:p
+    endif
+    return ''
+endfunction
+function! s:DocxRenderImageInTerm(path) abort
+    let l:cmd = s:DocxTermImageCmd(a:path)
+    if empty(l:cmd)
+        return 0
+    endif
+    execute '!' . l:cmd
+    return 1
+endfunction
+if !exists('g:docx_image_open_mode')
+    let g:docx_image_open_mode = 'auto'
+endif
+function! DocxOpenMedia() abort
+    let l:pid = s:DocxParaIdAtCursor()
+    if empty(l:pid)
+        echoerr 'Cursor not on a paragraph'
+        return
+    endif
+    let l:result = s:DocxCmd('extract', l:pid)
+    if v:shell_error
+        let l:msg = join(l:result, ' ')
+        if l:msg =~? 'no extractable media'
+            echo 'No image/object on this paragraph'
+        else
+            echoerr l:msg
+        endif
+        return
+    endif
+    let l:opener = s:DocxSystemOpenCmd()
+    let l:has_xlsx = s:DocxHasXlsxPlugin()
+    for l:path in l:result
+        if empty(l:path)
+            continue
+        endif
+        if l:has_xlsx && s:DocxIsExcelFile(l:path)
+            execute 'tabnew ' . fnameescape(l:path)
+            echo 'Opened in Vim tab: ' . l:path
+            continue
+        endif
+        if s:DocxIsImageFile(l:path)
+            if g:docx_image_open_mode ==# 'term'
+                if !s:DocxRenderImageInTerm(l:path)
+                    echoerr 'Terminal does not support inline images. Install chafa or use g:docx_image_open_mode = "os"'
+                endif
+                continue
+            elseif g:docx_image_open_mode ==# 'auto'
+                if s:DocxRenderImageInTerm(l:path)
+                    continue
+                endif
+            endif
+        endif
+        if has('win32') || has('win64')
+            silent! call system(l:opener . ' ' . shellescape(l:path))
+        else
+            call system(l:opener . ' ' . shellescape(l:path) . ' &')
+        endif
+        echo 'Opened: ' . l:path
+    endfor
 endfunction
 " ----------------------------------------------------------------------------
 " LIST OPERATIONS
 " ----------------------------------------------------------------------------
-" s:DocxListInfoAtLine(line): trả về [is_list, ilvl] cho dòng buffer.
-" Nếu line không phải list item -> [0, 0].
 function! s:DocxListInfoAtLine(line) abort
     if !exists('b:docx_list_info')
         return [0, 0]
@@ -818,14 +1123,8 @@ function! s:DocxListInfoAtLine(line) abort
     endfor
     return [0, 0]
 endfunction
-" ----------------------------------------------------------------------------
-" s:DocxIsLineEmpty(line): true nếu dòng buffer (sau khi strip prefix
-" render như "├ " hoặc "1. " hoặc "• ") không còn nội dung. Dùng để detect
-" "user đang ở list item rỗng" cho behavior Enter exit list.
-" ----------------------------------------------------------------------------
 function! s:DocxIsLineEmpty(line) abort
     let l:text = getline(a:line)
-    " Strip mọi prefix render khả dĩ: spaces, ├, ┊, # ##..., •, "1. ".
     let l:stripped = substitute(l:text, '^\s*', '', '')
     let l:stripped = substitute(l:stripped, '^[├┊]\s*', '', '')
     let l:stripped = substitute(l:stripped, '^#\+\s*', '', '')
@@ -834,47 +1133,59 @@ function! s:DocxIsLineEmpty(line) abort
     return empty(l:stripped)
 endfunction
 " ----------------------------------------------------------------------------
-" DocxListAdd(): chèn 1 dòng list mới ngay SAU paragraph tại cursor (hoặc
-" tại paragraph chỉ định). Nếu paragraph nguồn là list item, dòng mới kế
-" thừa numId + ilvl. Sau khi save, reload buffer + đặt cursor ở dòng mới
-" và vào Insert mode (giống Word khi nhấn Enter cuối list item).
+" DocxListAdd(): chèn 1 dòng list mới ngay SAU paragraph tại cursor.
 " ----------------------------------------------------------------------------
 function! DocxListAdd() abort
+    call s:DocxListAddImpl('after')
+endfunction
+" ----------------------------------------------------------------------------
+" DocxListAddBefore(): chèn paragraph mới NGAY TRƯỚC paragraph tại cursor.
+" Dùng cho mapping `O` (Shift-O).
+" ----------------------------------------------------------------------------
+function! DocxListAddBefore() abort
+    call s:DocxListAddImpl('before')
+endfunction
+function! s:DocxListAddImpl(position) abort
     let l:pid = s:DocxParaIdAtCursor()
     if empty(l:pid)
         echoerr 'Cursor not on a paragraph'
         return
     endif
     let l:current_line = line('.')
-    let l:result = s:DocxCmd('listadd', l:pid)
+    let l:result = s:DocxCmd('listadd', l:pid, a:position)
     if v:shell_error
         echoerr join(l:result, "\n")
         return
     endif
-    " Reload buffer
-    let l:output = s:DocxCmd('open')
-    if v:shell_error
-        echoerr join(l:output, "\n")
-        return
-    endif
-    call s:DocxLoadIntoBuffer(l:output)
+    call s:DocxLoadIntoBuffer(l:result)
     set nomodified
-    " Dòng mới chèn ngay sau dòng cũ -> cursor về dòng kế tiếp.
-    let l:new_line = l:current_line + 1
+    " Cursor vị trí dòng mới:
+    " - after  -> dòng kế tiếp (current+1)
+    " - before -> dòng hiện tại (paragraph mới chèn vào VỊ TRÍ này, paragraph
+    "             cũ bị đẩy xuống current+1)
+    let l:new_line = a:position ==# 'before' ? l:current_line : l:current_line + 1
     if l:new_line > line('$')
         let l:new_line = line('$')
     endif
-    " Di cursor đến cuối dòng mới + vào Insert mode.
     call cursor(l:new_line, 1)
-    " Skip prefix render (nếu là list "1. " hoặc "├ ") để cursor đứng ở
-    " vị trí text bắt đầu.
-    normal! $
-    startinsert!
+    " Vị trí cursor trong Insert mode:
+    " - Nếu dòng mới là dòng table (bắt đầu bằng `│`): đặt cursor SAU
+    "   `│ ` đầu — TRONG cell 0, tránh chèn text sau border `│` cuối làm
+    "   vỡ bảng.
+    " - Dòng thường: đi cuối dòng (text input bình thường).
+    let l:line_str = getline(l:new_line)
+    if l:line_str =~# '^│'
+        " `│` = 3 bytes UTF-8, space = 1 byte. byteidx(line, 2) = byte
+        " offset sau "│ " (2 ký tự đầu). +1 để cursor đứng ngay đầu cell text.
+        call cursor(l:new_line, byteidx(l:line_str, 2) + 1)
+        startinsert
+    else
+        normal! $
+        startinsert!
+    endif
 endfunction
 " ----------------------------------------------------------------------------
-" DocxListDel(): xoá paragraph tại cursor + reload buffer. Cẩn thận: KHÔNG
-" gọi cho mọi dd — chỉ khi user explicit. Mặc định plugin không map dd vì
-" sẽ confuse với behavior text editing thông thường.
+" DocxListDel(): xoá paragraph tại cursor + reload buffer.
 " ----------------------------------------------------------------------------
 function! DocxListDel() abort
     let l:pid = s:DocxParaIdAtCursor()
@@ -887,24 +1198,17 @@ function! DocxListDel() abort
         echoerr join(l:result, "\n")
         return
     endif
-    let l:output = s:DocxCmd('open')
-    call s:DocxLoadIntoBuffer(l:output)
+    call s:DocxLoadIntoBuffer(l:result)
     set nomodified
 endfunction
 " ----------------------------------------------------------------------------
 " DocxSmartTab(delta, line1, line2): Tab/Shift-Tab logic thông minh.
-" - Nếu paragraph là list item: gọi setilvl (tăng/giảm sub-level trong
-"   list — vd "1.1" -> "1.1.1").
-" - Nếu không: gọi indent thường (paragraph indent left).
-" Khi có vùng chọn mix cả 2 loại: xử lý mỗi nhóm riêng (non-list trước,
-" list sau — đơn giản nhất, không cần re-fetch state giữa chừng).
 " ----------------------------------------------------------------------------
 function! DocxSmartTab(delta, line1, line2) abort
     let l:ids = s:DocxResolveTargetParas(a:line1, a:line2)
     if empty(l:ids)
         return
     endif
-    " Build list pid set
     let l:list_pids = {}
     if exists('b:docx_list_info') && exists('b:docx_para_map')
         for l:li in b:docx_list_info
@@ -925,7 +1229,6 @@ function! DocxSmartTab(delta, line1, line2) abort
             call add(l:nonlist_ids, l:pid)
         endif
     endfor
-    " Áp non-list trước (đơn giản hơn — không cần re-fetch state).
     if !empty(l:nonlist_ids)
         call s:DocxRunStyleCmd('indent', l:nonlist_ids, a:delta)
     endif
@@ -936,47 +1239,35 @@ function! DocxSmartTab(delta, line1, line2) abort
 endfunction
 " ----------------------------------------------------------------------------
 " DocxListSmartEnter(): logic Enter trong list item.
-" - Nếu dòng list rỗng (chỉ có prefix "1. " hoặc tương tự):
-"     * Nếu ilvl > 0: giảm ilvl (về list cha) qua setstyle ilvl -1
-"     * Nếu ilvl == 0: thoát hẳn list qua listexit
-" - Nếu dòng list có nội dung: chèn dòng list mới (listadd) + vào Insert mode.
 " ----------------------------------------------------------------------------
 function! DocxListSmartEnter() abort
     let l:line = line('.')
     let [l:is_list, l:ilvl] = s:DocxListInfoAtLine(l:line)
     if !l:is_list
-        " Không phải list — fallback: chỉ thêm dòng paragraph mới (listadd
-        " trên non-list cũng OK, sẽ tạo paragraph thường rỗng).
         call DocxListAdd()
         return
     endif
     if s:DocxIsLineEmpty(l:line)
-        " Dòng list rỗng:
         let l:pid = s:DocxParaIdAtCursor()
         if l:ilvl > 0
-            " Giảm ilvl về list cha
             call s:DocxRunStyleCmd('ilvl', [l:pid], '-1')
         else
-            " ilvl=0 -> thoát list
             let l:result = s:DocxCmd('listexit', l:pid)
             if v:shell_error
                 echoerr join(l:result, "\n")
                 return
             endif
-            let l:output = s:DocxCmd('open')
-            call s:DocxLoadIntoBuffer(l:output)
+            call s:DocxLoadIntoBuffer(l:result)
             set nomodified
         endif
         call cursor(l:line, 1)
         startinsert!
     else
-        " Dòng list có nội dung -> chèn dòng mới
         call DocxListAdd()
     endif
 endfunction
 " ----------------------------------------------------------------------------
-" DocxDebug(line1, line2): debug helper — in ra thông tin paragraph và
-" Visual selection để chẩn đoán khi style command không hoạt động.
+" DocxDebug(line1, line2): debug helper.
 " ----------------------------------------------------------------------------
 function! DocxDebug(line1, line2) abort
     echo '--- DocxDebug ---'
@@ -996,44 +1287,6 @@ endfunction
 " ============================================================================
 " USER-FACING
 " ============================================================================
-" ----------------------------------------------------------------------------
-" Commands:
-"   :DocxBuild                  -> build Rust binary
-"   :DocxSave                   -> lưu buffer ra file .docx (cũng tự gọi qua :w)
-"   :DocxBold                   -> đảo bold paragraph tại cursor
-"   :'<,'>DocxBold              -> đảo bold mọi paragraph trong Visual selection
-"   :DocxItalic                 -> tương tự DocxBold
-"   :DocxSize <pt>              -> đặt font-size (vd :DocxSize 14)
-"   :DocxColor <color>          -> đặt màu chữ
-"   :DocxHighlight <color>      -> đặt màu nền (highlight) — vd yellow, green
-"   :DocxFont <name>            -> đặt font chữ (vd "Times New Roman", "Roboto")
-"   :DocxAlign <align>          -> đặt căn lề (left/center/right/both/justify/none)
-"   :DocxIndent <delta>         -> tăng/giảm indent (+1, -1, hoặc set 0/1/2)
-"   :DocxInfo                   -> hiện font/size/style tại cursor (echo)
-"   :DocxGoto <ref>             -> nhảy đến paragraph (vd :DocxGoto P3)
-"   :DocxDebug                  -> in info debug để chẩn đoán
-"
-" Tất cả các style command đều support Visual range :'<,'>...
-"
-" KEY MAPPINGS (local-to-buffer khi mở .docx):
-"   Tab        -> tăng indent 1 cấp (Normal: paragraph hiện tại;
-"                                    Visual: mọi paragraph trong vùng chọn)
-"   Shift-Tab  -> giảm indent 1 cấp
-"   CursorHold -> tự động hiện font/size info qua echo (sau updatetime ms idle)
-"
-" STATUSLINE: tự động hiển thị "<paragraph_id> — <file>". Thông tin KHÔNG
-" nằm trong buffer text nên không bị yank/copy theo.
-"
-" Màu hợp lệ (DocxColor): red, green, blue, yellow, orange, purple, gray,
-" white, black, "#RRGGBB", hoặc "none" để xoá màu.
-" Highlight chuẩn DOCX (DocxHighlight): yellow, green, cyan, magenta, blue,
-" red, darkBlue/Cyan/Green/Magenta/Red/Yellow/Gray, lightGray, black, white.
-"
-" LƯU Ý: plugin chỉ hỗ trợ SỬA text content + style của paragraph đã có.
-" KHÔNG thêm/xoá paragraph (số dòng trong buffer phải giữ nguyên khi save).
-" Cấu trúc DOCX gốc (table layout, header/footer, image) được giữ NGUYÊN
-" byte-for-byte qua minimal-diff save.
-" ----------------------------------------------------------------------------
 command! DocxBuild call DocxBuild()
 command! DocxSave call DocxSave()
 command! -range DocxBold call DocxBold(<line1>, <line2>)
@@ -1049,7 +1302,10 @@ command! -range -nargs=1 -complete=customlist,DocxAlignComplete DocxAlign
             \ call DocxAlign(<q-args>, <line1>, <line2>)
 command! -range -nargs=1 DocxIndent call DocxIndent(<q-args>, <line1>, <line2>)
 command! DocxListAdd call DocxListAdd()
+command! DocxListAddBefore call DocxListAddBefore()
 command! DocxListDel call DocxListDel()
+command! DocxListEnter call DocxListSmartEnter()
+command! DocxOpen call DocxOpenMedia()
 command! DocxInfo call DocxHoverInfo()
 command! -nargs=1 -complete=customlist,DocxGotoComplete DocxGoto call DocxGoto(<q-args>)
 command! -range DocxDebug call DocxDebug(<line1>, <line2>)

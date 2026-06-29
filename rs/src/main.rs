@@ -10,6 +10,7 @@
 
 mod error;
 mod model;
+mod numbering;
 mod parser;
 mod render;
 mod save;
@@ -43,6 +44,15 @@ fn dispatch(args: &[String]) -> AppResult<()> {
             let path = require_arg(args, 2, "docx_file")?;
             cmd_open(path)
         }
+        "create" => {
+            // Tạo file DOCX trống (template tối thiểu) tại path. Dùng
+            // cho file mới hoàn toàn — Vim BufReadCmd phát hiện file
+            // không tồn tại hoặc không phải zip valid → gọi create
+            // trước khi open.
+            let path = require_arg(args, 2, "docx_file")?;
+            cmd_create(path)?;
+            emit_open_output(path)
+        }
         "save" => {
             let path = require_arg(args, 2, "docx_file")?;
             let tmp = require_arg(args, 3, "tmp_file")?;
@@ -56,12 +66,15 @@ fn dispatch(args: &[String]) -> AppResult<()> {
             cmd_setstyle(path, para_ids, attr, value)
         }
         "listadd" => {
-            // Chèn 1 paragraph rỗng NGAY SAU paragraph có id = para_id.
-            // Paragraph mới kế thừa numId + ilvl từ source nếu source là
-            // list item. Dùng cho `o` trên list item.
+            // Chèn 1 paragraph rỗng SAU (mặc định) hoặc TRƯỚC paragraph
+            // có id = para_id. Position: "after" (default) | "before".
+            // Paragraph mới kế thừa numId/ilvl/pStyle/alignment + style
+            // run đầu (bold/italic/font/color) của source. Dùng cho `o` /
+            // `O` mappings trong Vim.
             let path = require_arg(args, 2, "docx_file")?;
             let para_id = require_arg(args, 3, "para_id")?;
-            cmd_listadd(path, para_id)
+            let position = args.get(4).map(|s| s.as_str()).unwrap_or("after");
+            cmd_listadd(path, para_id, position)
         }
         "listdel" => {
             // Xoá paragraph có id = para_id. Dùng cho `dd` trên dòng list
@@ -71,11 +84,18 @@ fn dispatch(args: &[String]) -> AppResult<()> {
             cmd_listdel(path, para_id)
         }
         "listexit" => {
-            // Thoát khỏi list: xoá num_id + num_ilvl của paragraph. Dùng
-            // khi user Enter trên list item rỗng đã ở ilvl=0.
             let path = require_arg(args, 2, "docx_file")?;
             let para_id = require_arg(args, 3, "para_id")?;
             cmd_listexit(path, para_id)
+        }
+        "extract" => {
+            // Extract media (image/OLE object) của paragraph có id =
+            // para_id ra /tmp/. Print path file đã extract qua stdout
+            // để Vim biết mở app nào. Nếu paragraph có nhiều media,
+            // extract tất cả và print mỗi path 1 dòng.
+            let path = require_arg(args, 2, "docx_file")?;
+            let para_id = require_arg(args, 3, "para_id")?;
+            cmd_extract(path, para_id)
         }
         _ => Err(AppError(format!("Unknown command: {cmd}"))),
     }
@@ -87,19 +107,76 @@ fn require_arg<'a>(args: &'a [String], idx: usize, name: &str) -> AppResult<&'a 
         .ok_or_else(|| AppError(format!("Missing argument: {name}")))
 }
 
+/// Helper: load numbering.xml từ zip và parse -> map (numId, ilvl) ->
+/// LvlTemplate. Trả về empty map nếu file không có numbering.xml hoặc
+/// parse fail (DOCX không có list cũng OK).
+fn load_numbering<R: std::io::Read + std::io::Seek>(
+    archive: &mut zip::ZipArchive<R>,
+) -> std::collections::HashMap<(u32, u32), numbering::LvlTemplate> {
+    match zip_io::read_entry(archive, "word/numbering.xml") {
+        Ok(bytes) => numbering::parse_numbering(&bytes).unwrap_or_default(),
+        Err(_) => std::collections::HashMap::new(),
+    }
+}
+
+/// Tạo file DOCX trống tại path. Template minimal — đủ để Word/LibreOffice
+/// mở được và plugin có thể parse/edit. Gọi khi user mở file .docx chưa
+/// tồn tại hoặc file không phải DOCX hợp lệ (vd plain text với extension
+/// .docx).
+fn cmd_create(path: &str) -> AppResult<()> {
+    use std::io::Write;
+    use zip::write::FileOptions;
+    use zip::CompressionMethod;
+
+    let content_types = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
+<Default Extension="xml" ContentType="application/xml"/>
+<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
+<Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/>
+</Types>"#;
+
+    let rels = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/>
+</Relationships>"#;
+
+    let document = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+<w:body>
+<w:p/>
+<w:sectPr/>
+</w:body>
+</w:document>"#;
+
+    let file = std::fs::File::create(path).map_err(|e| AppError(format!("Create file: {e}")))?;
+    let mut zip = zip::ZipWriter::new(file);
+    let opts = FileOptions::default().compression_method(CompressionMethod::Deflated);
+
+    zip.start_file("[Content_Types].xml", opts).map_err(|e| AppError(format!("Zip: {e}")))?;
+    zip.write_all(content_types.as_bytes()).map_err(|e| AppError(format!("Write: {e}")))?;
+    zip.start_file("_rels/.rels", opts).map_err(|e| AppError(format!("Zip: {e}")))?;
+    zip.write_all(rels.as_bytes()).map_err(|e| AppError(format!("Write: {e}")))?;
+    zip.start_file("word/document.xml", opts).map_err(|e| AppError(format!("Zip: {e}")))?;
+    zip.write_all(document.as_bytes()).map_err(|e| AppError(format!("Write: {e}")))?;
+    zip.finish().map_err(|e| AppError(format!("Zip finish: {e}")))?;
+    Ok(())
+}
+
 fn cmd_open(path: &str) -> AppResult<()> {
     let mut archive = zip_io::open_archive(path)?;
     let xml = zip_io::read_entry(&mut archive, "word/document.xml")?;
     let doc = parser::parse_document(&xml)?;
-    let r = render::render(&doc);
+    let numbering = load_numbering(&mut archive);
+    let r = render::render(&doc, &numbering);
     println!("{}", r.text);
     println!("@@STYLE@@");
-    for (line, cs, ce, bold, italic, size_pt, color, font) in &r.style_meta {
+    for (line, cs, ce, bold, italic, size_pt, color, font, highlight) in &r.style_meta {
         let size_str = size_pt.map(|s| format!("{s}")).unwrap_or_else(|| "-".to_string());
         let color_str = color.as_deref().unwrap_or("-");
         let font_str = font.as_deref().unwrap_or("-");
+        let hl_str = highlight.as_deref().unwrap_or("-");
         println!(
-            "{line}\t{cs}\t{ce}\t{b}\t{i}\t{size_str}\t{color_str}\t{font_str}",
+            "{line}\t{cs}\t{ce}\t{b}\t{i}\t{size_str}\t{color_str}\t{font_str}\t{hl_str}",
             b = *bold as u8,
             i = *italic as u8,
         );
@@ -115,6 +192,11 @@ fn cmd_open(path: &str) -> AppResult<()> {
         println!("{line}\t{ilvl}");
     }
     println!("@@LISTINFOEND@@");
+    println!("@@CELLMAP@@");
+    for (line, col, cs, ce, pid) in &r.cell_map {
+        println!("{line}\t{col}\t{cs}\t{ce}\t{pid}");
+    }
+    println!("@@CELLMAPEND@@");
     Ok(())
 }
 
@@ -123,10 +205,11 @@ fn cmd_save(path: &str, tmp_path: &str) -> AppResult<()> {
     let mut archive = zip_io::open_archive(path)?;
     let xml = zip_io::read_entry(&mut archive, "word/document.xml")?;
     let doc = parser::parse_document(&xml)?;
-    let new_xml = save::apply_buffer_to_document(&doc, &new_text)?;
+    let numbering = load_numbering(&mut archive);
+    let new_xml = save::apply_buffer_to_document(&doc, &new_text, &numbering)?;
     let new_bytes = zip_io::write_replacing_entries(&mut archive, &[("word/document.xml", new_xml)])?;
     zip_io::atomic_write(path, &new_bytes)?;
-    Ok(())
+    emit_open_output(path)
 }
 
 fn cmd_setstyle(path: &str, para_ids: &str, attr: &str, value: &str) -> AppResult<()> {
@@ -154,6 +237,51 @@ fn cmd_setstyle(path: &str, para_ids: &str, attr: &str, value: &str) -> AppResul
     let new_xml = save::rebuild_document_xml(&doc)?;
     let new_bytes = zip_io::write_replacing_entries(&mut archive, &[("word/document.xml", new_xml)])?;
     zip_io::atomic_write(path, &new_bytes)?;
+    // Emit luôn output 'open' để Vim không phải spawn binary lần 2.
+    // Để tránh re-parse XML mới, mình render từ `doc` (đã có sẵn trong RAM).
+    // Tuy nhiên byte_range của doc cũ vẫn map sang XML CŨ — vì doc đã được
+    // mutate. Bypass: re-open file mới để có byte_range mới (đảm bảo
+    // paramap chính xác).
+    emit_open_output(path)
+}
+
+/// Helper: re-open file đã save, render và emit metadata blocks tương tự
+/// cmd_open. Tránh duplicate code cho mọi command có "save-then-open".
+fn emit_open_output(path: &str) -> AppResult<()> {
+    let mut archive = zip_io::open_archive(path)?;
+    let xml = zip_io::read_entry(&mut archive, "word/document.xml")?;
+    let doc = parser::parse_document(&xml)?;
+    let numbering = load_numbering(&mut archive);
+    let r = render::render(&doc, &numbering);
+    println!("{}", r.text);
+    println!("@@STYLE@@");
+    for (line, cs, ce, bold, italic, size_pt, color, font, highlight) in &r.style_meta {
+        let size_str = size_pt.map(|s| format!("{s}")).unwrap_or_else(|| "-".to_string());
+        let color_str = color.as_deref().unwrap_or("-");
+        let font_str = font.as_deref().unwrap_or("-");
+        let hl_str = highlight.as_deref().unwrap_or("-");
+        println!(
+            "{line}\t{cs}\t{ce}\t{b}\t{i}\t{size_str}\t{color_str}\t{font_str}\t{hl_str}",
+            b = *bold as u8,
+            i = *italic as u8,
+        );
+    }
+    println!("@@END@@");
+    println!("@@PARAMAP@@");
+    for (line, pid) in &r.para_map {
+        println!("{line}\t{pid}");
+    }
+    println!("@@PARAMAPEND@@");
+    println!("@@LISTINFO@@");
+    for (line, ilvl) in &r.list_info {
+        println!("{line}\t{ilvl}");
+    }
+    println!("@@LISTINFOEND@@");
+    println!("@@CELLMAP@@");
+    for (line, col, cs, ce, pid) in &r.cell_map {
+        println!("{line}\t{col}\t{cs}\t{ce}\t{pid}");
+    }
+    println!("@@CELLMAPEND@@");
     Ok(())
 }
 
@@ -164,7 +292,7 @@ fn cmd_setstyle(path: &str, para_ids: &str, attr: &str, value: &str) -> AppResul
 // thẳng trong document.xml gốc, KHÔNG re-emit toàn bộ — vẫn giữ
 // minimal-diff cho mọi paragraph khác.
 
-fn cmd_listadd(path: &str, para_id: &str) -> AppResult<()> {
+fn cmd_listadd(path: &str, para_id: &str, position: &str) -> AppResult<()> {
     let mut archive = zip_io::open_archive(path)?;
     let xml = zip_io::read_entry(&mut archive, "word/document.xml")?;
     let doc = parser::parse_document(&xml)?;
@@ -176,41 +304,101 @@ fn cmd_listadd(path: &str, para_id: &str) -> AppResult<()> {
         .find(|p| p.id == para_id)
         .ok_or_else(|| AppError(format!("Paragraph not found: {para_id}")))?;
 
-    // Build XML của paragraph mới: nếu source là list item, kế thừa numId
-    // + ilvl; nếu không, paragraph thường rỗng.
-    let new_para_xml = if let Some(num_id) = src.num_id {
+    // Build pPr inner cho paragraph mới — kế thừa MỌI thuộc tính paragraph
+    // từ source (numPr, indent, alignment, pStyle nếu là list style):
+    let mut ppr_inner = String::new();
+    // pStyle: kế thừa cho list style HOẶC heading (để dòng mới giữ cùng style)
+    if let Some(style) = &src.para_style {
+        if style.starts_with("List") || style.starts_with("Heading") || style == "Title" {
+            ppr_inner.push_str(&format!("<w:pStyle w:val=\"{style}\"/>"));
+        }
+    }
+    // numPr: kế thừa cho list item (inline numbering)
+    if let Some(num_id) = src.num_id {
         let ilvl = src.num_ilvl.unwrap_or(0);
-        format!(
-            "<w:p><w:pPr><w:numPr><w:ilvl w:val=\"{ilvl}\"/><w:numId w:val=\"{num_id}\"/></w:numPr></w:pPr></w:p>"
-        )
+        ppr_inner.push_str(&format!(
+            "<w:numPr><w:ilvl w:val=\"{ilvl}\"/><w:numId w:val=\"{num_id}\"/></w:numPr>"
+        ));
+    } else if let Some(ilvl) = src.num_ilvl {
+        ppr_inner.push_str(&format!("<w:numPr><w:ilvl w:val=\"{ilvl}\"/></w:numPr>"));
+    }
+    // indent: kế thừa nếu source có
+    if let Some(ind) = src.indent_twips {
+        if ind != 0 {
+            ppr_inner.push_str(&format!("<w:ind w:left=\"{ind}\"/>"));
+        }
+    }
+    // alignment: kế thừa căn lề
+    if let Some(jc) = &src.alignment {
+        ppr_inner.push_str(&format!("<w:jc w:val=\"{jc}\"/>"));
+    }
+
+    // Kế thừa style của FIRST RUN (bold/italic/font/color/size/highlight)
+    // cho paragraph mới — nếu dòng cũ in đậm thì dòng mới cũng đậm.
+    let rpr_inner = build_first_run_rpr(src);
+    let run_xml = if rpr_inner.is_empty() {
+        String::new()
     } else {
-        // Paragraph thường rỗng. Giữ alignment + indent nếu có (tiện cho
-        // user khi `o` trên paragraph thường — dòng mới cùng format).
-        let mut ppr_inner = String::new();
-        if let Some(ind) = src.indent_twips {
-            if ind != 0 {
-                ppr_inner.push_str(&format!("<w:ind w:left=\"{ind}\"/>"));
-            }
-        }
-        if let Some(jc) = &src.alignment {
-            ppr_inner.push_str(&format!("<w:jc w:val=\"{jc}\"/>"));
-        }
-        if ppr_inner.is_empty() {
-            "<w:p/>".to_string()
-        } else {
-            format!("<w:p><w:pPr>{ppr_inner}</w:pPr></w:p>")
-        }
+        format!("<w:r><w:rPr>{rpr_inner}</w:rPr></w:r>")
     };
 
-    // Chèn vào XML gốc ngay SAU </w:p> của source paragraph.
+    let new_para_xml = if ppr_inner.is_empty() && run_xml.is_empty() {
+        "<w:p/>".to_string()
+    } else if run_xml.is_empty() {
+        format!("<w:p><w:pPr>{ppr_inner}</w:pPr></w:p>")
+    } else if ppr_inner.is_empty() {
+        format!("<w:p>{run_xml}</w:p>")
+    } else {
+        format!("<w:p><w:pPr>{ppr_inner}</w:pPr>{run_xml}</w:p>")
+    };
+
+    // Chèn vào XML gốc: TRƯỚC <w:p> của source (position=before) hoặc
+    // SAU </w:p> của source (position=after, mặc định).
+    let insert_pos = match position {
+        "before" => src.byte_range.0,
+        _ => src.byte_range.1,
+    };
     let mut new_xml: Vec<u8> = Vec::with_capacity(xml.len() + new_para_xml.len());
-    new_xml.extend_from_slice(&xml[..src.byte_range.1]);
+    new_xml.extend_from_slice(&xml[..insert_pos]);
     new_xml.extend_from_slice(new_para_xml.as_bytes());
-    new_xml.extend_from_slice(&xml[src.byte_range.1..]);
+    new_xml.extend_from_slice(&xml[insert_pos..]);
 
     let new_bytes = zip_io::write_replacing_entries(&mut archive, &[("word/document.xml", new_xml)])?;
     zip_io::atomic_write(path, &new_bytes)?;
-    Ok(())
+    emit_open_output(path)
+}
+
+/// Build rPr nội dung XML từ style của run đầu tiên của paragraph nguồn.
+/// Dùng cho listadd để dòng mới kế thừa font/bold/italic/color.
+fn build_first_run_rpr(src: &model::Paragraph) -> String {
+    let first = src.runs.iter().find(|r| !r.is_drawing);
+    let first = match first {
+        Some(r) if !r.style.is_default() => r,
+        _ => return String::new(),
+    };
+    let mut s = String::new();
+    if let Some(font) = &first.style.font_name {
+        s.push_str(&format!(
+            "<w:rFonts w:ascii=\"{f}\" w:hAnsi=\"{f}\" w:cs=\"{f}\"/>",
+            f = font
+        ));
+    }
+    if first.style.bold {
+        s.push_str("<w:b/>");
+    }
+    if first.style.italic {
+        s.push_str("<w:i/>");
+    }
+    if let Some(sz) = first.style.size_half_pt {
+        s.push_str(&format!("<w:sz w:val=\"{sz}\"/><w:szCs w:val=\"{sz}\"/>"));
+    }
+    if let Some(color) = &first.style.color_hex {
+        s.push_str(&format!("<w:color w:val=\"{color}\"/>"));
+    }
+    if let Some(hl) = &first.style.highlight {
+        s.push_str(&format!("<w:highlight w:val=\"{hl}\"/>"));
+    }
+    s
 }
 
 fn cmd_listdel(path: &str, para_id: &str) -> AppResult<()> {
@@ -231,7 +419,7 @@ fn cmd_listdel(path: &str, para_id: &str) -> AppResult<()> {
 
     let new_bytes = zip_io::write_replacing_entries(&mut archive, &[("word/document.xml", new_xml)])?;
     zip_io::atomic_write(path, &new_bytes)?;
-    Ok(())
+    emit_open_output(path)
 }
 
 fn cmd_listexit(path: &str, para_id: &str) -> AppResult<()> {
@@ -253,21 +441,154 @@ fn cmd_listexit(path: &str, para_id: &str) -> AppResult<()> {
     let new_xml = save::rebuild_document_xml(&doc)?;
     let new_bytes = zip_io::write_replacing_entries(&mut archive, &[("word/document.xml", new_xml)])?;
     zip_io::atomic_write(path, &new_bytes)?;
+    emit_open_output(path)
+}
+
+fn cmd_extract(path: &str, para_id: &str) -> AppResult<()> {
+    let mut archive = zip_io::open_archive(path)?;
+    let xml = zip_io::read_entry(&mut archive, "word/document.xml")?;
+    let doc = parser::parse_document(&xml)?;
+
+    let p = doc
+        .paragraphs
+        .iter()
+        .find(|p| p.id == para_id)
+        .ok_or_else(|| AppError(format!("Paragraph not found: {para_id}")))?;
+
+    // Đọc document.xml.rels để map rel_id -> target file
+    let rels_xml = zip_io::read_entry(&mut archive, "word/_rels/document.xml.rels")?;
+    let rel_map = parse_rels(&rels_xml);
+
+    let mut found_any = false;
+    for run in &p.runs {
+        if !run.is_drawing {
+            continue;
+        }
+        let rel_id = match &run.rel_id {
+            Some(r) => r,
+            None => continue,
+        };
+        let target = match rel_map.get(rel_id.as_str()) {
+            Some(t) => t.clone(),
+            None => continue,
+        };
+        // Target có dạng "media/image1.png" — đường dẫn relative tới
+        // word/. Trong zip thì entry là "word/media/image1.png".
+        let entry_path = if target.starts_with('/') {
+            // Absolute trong zip
+            target.trim_start_matches('/').to_string()
+        } else {
+            format!("word/{target}")
+        };
+        // Extract bytes
+        let bytes = match zip_io::read_entry(&mut archive, &entry_path) {
+            Ok(b) => b,
+            Err(_) => continue,
+        };
+        // Lấy filename cuối + write ra /tmp/docx_<para_id>_<filename>
+        let filename = entry_path
+            .rsplit('/')
+            .next()
+            .unwrap_or("attachment.bin");
+        let tmp_dir = std::env::temp_dir();
+        let out_path = tmp_dir.join(format!("docx_{para_id}_{filename}"));
+        std::fs::write(&out_path, &bytes)?;
+        // Print path để Vim đọc
+        println!("{}", out_path.display());
+        found_any = true;
+    }
+
+    if !found_any {
+        return Err(AppError(format!(
+            "Paragraph {para_id} has no extractable media (image/object)"
+        )));
+    }
     Ok(())
+}
+
+/// Parse document.xml.rels — XML đơn giản dạng:
+///   <Relationships xmlns="...">
+///     <Relationship Id="rId4" Type="..." Target="media/image1.png"/>
+///     ...
+///   </Relationships>
+/// Trả về HashMap rel_id -> target.
+fn parse_rels(xml: &[u8]) -> std::collections::HashMap<String, String> {
+    use quick_xml::events::Event;
+    use quick_xml::reader::Reader;
+
+    let mut map = std::collections::HashMap::new();
+    let mut reader = Reader::from_reader(xml);
+    reader.trim_text(true);
+    let mut buf = Vec::new();
+    loop {
+        buf.clear();
+        match reader.read_event_into(&mut buf) {
+            Ok(Event::Empty(e)) | Ok(Event::Start(e)) => {
+                // local name = "Relationship"
+                let name = e.name();
+                let local = match name.as_ref().iter().position(|&b| b == b':') {
+                    Some(i) => &name.as_ref()[i + 1..],
+                    None => name.as_ref(),
+                };
+                if local == b"Relationship" {
+                    let mut id = None;
+                    let mut target = None;
+                    for attr in e.attributes().flatten() {
+                        match attr.key.as_ref() {
+                            b"Id" => {
+                                id = Some(String::from_utf8_lossy(&attr.value).into_owned());
+                            }
+                            b"Target" => {
+                                target = Some(String::from_utf8_lossy(&attr.value).into_owned());
+                            }
+                            _ => {}
+                        }
+                    }
+                    if let (Some(i), Some(t)) = (id, target) {
+                        map.insert(i, t);
+                    }
+                }
+            }
+            Ok(Event::Eof) => break,
+            Err(_) => break,
+            _ => {}
+        }
+    }
+    map
 }
 
 fn apply_style_attr(p: &mut model::Paragraph, attr: &str, value: &str) -> AppResult<()> {
     match attr {
         "togglebold" => {
-            let any_not_bold = p.runs.iter().any(|r| !r.style.bold);
-            for r in p.runs.iter_mut() {
-                r.style.bold = any_not_bold;
+            if p.runs.is_empty() {
+                p.runs.push(model::Run {
+                    text: String::new(),
+                    style: model::RunStyle { bold: true, ..Default::default() },
+                    is_drawing: false,
+                    rel_id: None,
+                    byte_range: None,
+                });
+            } else {
+                let any_not_bold = p.runs.iter().any(|r| !r.style.bold);
+                for r in p.runs.iter_mut() {
+                    r.style.bold = any_not_bold;
+                }
             }
         }
         "toggleitalic" => {
-            let any_not_italic = p.runs.iter().any(|r| !r.style.italic);
-            for r in p.runs.iter_mut() {
-                r.style.italic = any_not_italic;
+            if p.runs.is_empty() {
+                p.runs.push(model::Run {
+                    text: String::new(),
+                    style: model::RunStyle { italic: true, ..Default::default() },
+                    is_drawing: false,
+                    rel_id: None,
+                    byte_range: None,
+                });
+            } else {
+                let any_not_italic = p.runs.iter().any(|r| !r.style.italic);
+                for r in p.runs.iter_mut() {
+                    r.style.italic = any_not_italic;
+                }
             }
         }
         "size" => {
@@ -275,14 +596,34 @@ fn apply_style_attr(p: &mut model::Paragraph, attr: &str, value: &str) -> AppRes
                 .parse()
                 .map_err(|_| AppError(format!("Invalid size: {value}")))?;
             let half = (pt * 2.0).round() as u32;
-            for r in p.runs.iter_mut() {
-                r.style.size_half_pt = Some(half);
+            if p.runs.is_empty() {
+                p.runs.push(model::Run {
+                    text: String::new(),
+                    style: model::RunStyle { size_half_pt: Some(half), ..Default::default() },
+                    is_drawing: false,
+                    rel_id: None,
+                    byte_range: None,
+                });
+            } else {
+                for r in p.runs.iter_mut() {
+                    r.style.size_half_pt = Some(half);
+                }
             }
         }
         "color" => {
             let v = parse_color(value)?;
-            for r in p.runs.iter_mut() {
-                r.style.color_hex = v.clone();
+            if p.runs.is_empty() && v.is_some() {
+                p.runs.push(model::Run {
+                    text: String::new(),
+                    style: model::RunStyle { color_hex: v.clone(), ..Default::default() },
+                    is_drawing: false,
+                    rel_id: None,
+                    byte_range: None,
+                });
+            } else {
+                for r in p.runs.iter_mut() {
+                    r.style.color_hex = v.clone();
+                }
             }
         }
         "highlight" => {
@@ -297,8 +638,18 @@ fn apply_style_attr(p: &mut model::Paragraph, attr: &str, value: &str) -> AppRes
             } else {
                 Some(value.trim().to_string())
             };
-            for r in p.runs.iter_mut() {
-                r.style.highlight = v.clone();
+            if p.runs.is_empty() && v.is_some() {
+                p.runs.push(model::Run {
+                    text: String::new(),
+                    style: model::RunStyle { highlight: v.clone(), ..Default::default() },
+                    is_drawing: false,
+                    rel_id: None,
+                    byte_range: None,
+                });
+            } else {
+                for r in p.runs.iter_mut() {
+                    r.style.highlight = v.clone();
+                }
             }
         }
         "font" => {
@@ -311,8 +662,25 @@ fn apply_style_attr(p: &mut model::Paragraph, attr: &str, value: &str) -> AppRes
             } else {
                 Some(v.to_string())
             };
-            for r in p.runs.iter_mut() {
-                r.style.font_name = opt.clone();
+            // Nếu paragraph KHÔNG có run nào (empty paragraph, vd dòng
+            // mới insert chưa gõ text), tạo placeholder run với font
+            // mới — để emit_paragraph có chỗ gắn rFonts. Đảm bảo
+            // Word render với font đúng kể cả khi paragraph empty.
+            if p.runs.is_empty() && opt.is_some() {
+                p.runs.push(model::Run {
+                    text: String::new(),
+                    style: model::RunStyle {
+                        font_name: opt.clone(),
+                        ..Default::default()
+                    },
+                    is_drawing: false,
+                    rel_id: None,
+                    byte_range: None,
+                });
+            } else {
+                for r in p.runs.iter_mut() {
+                    r.style.font_name = opt.clone();
+                }
             }
         }
         "indent" => {

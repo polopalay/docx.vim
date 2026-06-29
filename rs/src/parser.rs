@@ -31,6 +31,12 @@ pub fn parse_document(xml_bytes: &[u8]) -> AppResult<Document> {
     // Stack track new row events — khi gặp <w:p> đầu tiên trong row mới,
     // set is_first_in_row = true rồi clear flag.
     let mut row_just_started = false;
+    // Track vị trí row/col trong table hiện tại. Reset row khi gặp <w:tbl>,
+    // tăng khi </w:tr>; reset col khi <w:tr>, tăng khi </w:tc>.
+    let mut current_row_idx: u32 = 0;
+    let mut current_col_idx: u32 = 0;
+    // True khi mới vào cell (<w:tc>), reset sau paragraph đầu tiên của cell.
+    let mut cell_just_started = false;
     let mut sdt_depth: u32 = 0;
     let mut next_para_id: usize = 0;
 
@@ -61,6 +67,8 @@ pub fn parse_document(xml_bytes: &[u8]) -> AppResult<Document> {
             }
             ScanAction::TblStart => {
                 table_depth += 1;
+                current_row_idx = 0;
+                current_col_idx = 0;
             }
             ScanAction::TblEnd => {
                 if table_depth > 0 {
@@ -69,10 +77,18 @@ pub fn parse_document(xml_bytes: &[u8]) -> AppResult<Document> {
             }
             ScanAction::TrStart => {
                 row_just_started = true;
+                current_col_idx = 0;
             }
             ScanAction::TrEnd => {
-                // Đánh dấu paragraph cuối cùng trong row vừa kết thúc.
                 mark_last_in_row(&mut doc);
+                current_row_idx += 1;
+            }
+            ScanAction::TcStart => {
+                cell_just_started = true;
+            }
+            ScanAction::TcEnd => {
+                current_col_idx += 1;
+                cell_just_started = false;
             }
             ScanAction::SdtStart => {
                 sdt_depth += 1;
@@ -86,18 +102,17 @@ pub fn parse_document(xml_bytes: &[u8]) -> AppResult<Document> {
                 if !in_body {
                     continue;
                 }
-                // Compute context
-                let ctx = current_context(table_depth, sdt_depth, row_just_started);
-                let first_in_row = matches!(
-                    &ctx,
-                    ParaContext::TableCell {
-                        is_first_in_row: true,
-                        ..
-                    }
+                let ctx = current_context(
+                    table_depth, sdt_depth, row_just_started,
+                    current_row_idx, current_col_idx, cell_just_started,
                 );
-                if first_in_row {
+                if matches!(
+                    &ctx,
+                    ParaContext::TableCell { is_first_in_row: true, .. }
+                ) {
                     row_just_started = false;
                 }
+                cell_just_started = false; // paragraph này là first_in_cell, sau đó reset
                 parse_paragraph_body(
                     &mut reader,
                     &mut buf,
@@ -111,17 +126,17 @@ pub fn parse_document(xml_bytes: &[u8]) -> AppResult<Document> {
                 if !in_body {
                     continue;
                 }
-                let ctx = current_context(table_depth, sdt_depth, row_just_started);
-                let first_in_row = matches!(
-                    &ctx,
-                    ParaContext::TableCell {
-                        is_first_in_row: true,
-                        ..
-                    }
+                let ctx = current_context(
+                    table_depth, sdt_depth, row_just_started,
+                    current_row_idx, current_col_idx, cell_just_started,
                 );
-                if first_in_row {
+                if matches!(
+                    &ctx,
+                    ParaContext::TableCell { is_first_in_row: true, .. }
+                ) {
                     row_just_started = false;
                 }
+                cell_just_started = false;
                 let byte_end = reader.buffer_position();
                 let para = Paragraph {
                     id: format!("P{}", next_para_id),
@@ -146,12 +161,18 @@ pub fn parse_document(xml_bytes: &[u8]) -> AppResult<Document> {
     Ok(doc)
 }
 
-fn current_context(table_depth: u32, sdt_depth: u32, row_just_started: bool) -> ParaContext {
+fn current_context(
+    table_depth: u32, sdt_depth: u32, row_just_started: bool,
+    row_idx: u32, col_idx: u32, cell_just_started: bool,
+) -> ParaContext {
     if table_depth > 0 {
         ParaContext::TableCell {
             table_depth,
             is_first_in_row: row_just_started,
             is_last_in_row: false,
+            col_idx,
+            row_idx,
+            is_first_in_cell: cell_just_started,
         }
     } else if sdt_depth > 0 {
         ParaContext::Sdt
@@ -181,6 +202,8 @@ enum ScanAction {
     TblEnd,
     TrStart,
     TrEnd,
+    TcStart,
+    TcEnd,
     SdtStart,
     SdtEnd,
     PStart,
@@ -194,6 +217,7 @@ fn classify_start(e: &BytesStart<'_>) -> ScanAction {
         b"body" => ScanAction::BodyStart,
         b"tbl" => ScanAction::TblStart,
         b"tr" => ScanAction::TrStart,
+        b"tc" => ScanAction::TcStart,
         b"sdtContent" => ScanAction::SdtStart,
         b"p" => ScanAction::PStart,
         _ => ScanAction::Other,
@@ -212,6 +236,7 @@ fn classify_end(e: &quick_xml::events::BytesEnd<'_>) -> ScanAction {
         b"body" => ScanAction::BodyEnd,
         b"tbl" => ScanAction::TblEnd,
         b"tr" => ScanAction::TrEnd,
+        b"tc" => ScanAction::TcEnd,
         b"sdtContent" => ScanAction::SdtEnd,
         _ => ScanAction::Other,
     }
@@ -255,9 +280,21 @@ fn parse_paragraph_body(
     // True nếu run hiện tại chứa drawing/pict (image).
     let mut current_has_drawing = false;
     let mut drawing_depth: i32 = 0;
+    // Rel ID extract từ <a:blip r:embed=".."/> hoặc <v:imagedata r:id=".."/>
+    // hoặc <o:OLEObject r:id=".."/> trong drawing block. Lưu để map sang
+    // file media qua document.xml.rels khi extract.
+    let mut current_rel_id: Option<String> = None;
+    // Byte position của <w:r> hiện tại trong original XML. Dùng để set
+    // byte_range cho run drawing — khi emit paragraph dirty, copy nguyên
+    // byte này thay vì tái tạo XML drawing phức tạp.
+    let mut current_run_byte_start: Option<usize> = None;
 
     loop {
         buf.clear();
+        // Vị trí byte TRƯỚC khi đọc event tiếp theo. Capture trước khi
+        // read_event_into() advance buffer_position(). Dùng cho byte_range
+        // của run.
+        let event_pos_before_inner = reader.buffer_position();
         let evt = reader.read_event_into(buf)?;
         match evt {
             Event::Start(e) => {
@@ -301,7 +338,10 @@ fn parse_paragraph_body(
                             text: String::new(),
                             style: RunStyle::default(),
                             is_drawing: false,
+                            rel_id: None,
+                            byte_range: None,
                         });
+                        current_run_byte_start = Some(event_pos_before_inner);
                         current_has_drawing = false;
                     }
                     b"rPr" => in_rpr = true,
@@ -314,6 +354,17 @@ fn parse_paragraph_body(
                     b"t" => in_text = true,
                     b"drawing" | b"pict" | b"object" => {
                         current_has_drawing = true;
+                        drawing_depth += 1;
+                    }
+                    b"blip" | b"imagedata" | b"OLEObject" if drawing_depth > 0 => {
+                        // <a:blip r:embed="rId4"/> hoặc <v:imagedata r:id=".."/>
+                        // hoặc <o:OLEObject r:id=".."/>. Lấy rel_id để map
+                        // sang file media qua document.xml.rels.
+                        let v = attr_val(&e, b"r:embed")
+                            .or_else(|| attr_val(&e, b"r:id"));
+                        if let Some(rid) = v {
+                            current_rel_id = Some(rid);
+                        }
                         drawing_depth += 1;
                     }
                     _ => {
@@ -369,6 +420,14 @@ fn parse_paragraph_body(
                             run.text.push('\u{2028}');
                         }
                     }
+                    b"blip" | b"imagedata" | b"OLEObject" if drawing_depth > 0 => {
+                        // Self-closing variant của image relationship tag.
+                        let v = attr_val(&e, b"r:embed")
+                            .or_else(|| attr_val(&e, b"r:id"));
+                        if let Some(rid) = v {
+                            current_rel_id = Some(rid);
+                        }
+                    }
                     _ => {}
                 }
             }
@@ -399,6 +458,17 @@ fn parse_paragraph_body(
                     b"r" => {
                         if let Some(mut run) = current_run.take() {
                             run.is_drawing = current_has_drawing;
+                            run.rel_id = current_rel_id.take();
+                            // Set byte_range chỉ cho drawing run — để khi
+                            // emit paragraph dirty, copy nguyên byte XML
+                            // gốc của <w:r>...<w:drawing/>...</w:r>.
+                            if run.is_drawing {
+                                let end = reader.buffer_position();
+                                if let Some(start) = current_run_byte_start {
+                                    run.byte_range = Some((start, end));
+                                }
+                            }
+                            current_run_byte_start = None;
                             current_has_drawing = false;
                             // Giữ run nếu có text hoặc có style hoặc có drawing
                             if !run.text.is_empty() || !run.style.is_default() || run.is_drawing {

@@ -4,7 +4,7 @@
 use crate::model::*;
 use std::fmt::Write;
 
-pub fn emit_paragraph(p: &Paragraph) -> String {
+pub fn emit_paragraph(p: &Paragraph, original_xml: &[u8]) -> String {
     let mut s = String::with_capacity(256);
     s.push_str("<w:p>");
 
@@ -45,17 +45,26 @@ pub fn emit_paragraph(p: &Paragraph) -> String {
     }
 
     for run in &p.runs {
-        emit_run(run, &mut s);
+        emit_run(run, &mut s, original_xml);
     }
 
     s.push_str("</w:p>");
     s
 }
 
-fn emit_run(run: &Run, s: &mut String) {
-    // Drawing runs không nên được dirty/re-emit ở MVP này. Nếu vẫn được
-    // gọi, emit run rỗng để không crash file.
+fn emit_run(run: &Run, s: &mut String, original_xml: &[u8]) {
+    // Drawing run: copy nguyên byte XML gốc từ original_xml (giữ ảnh,
+    // OLE object, shape). Nếu thiếu byte_range (shouldn't happen sau
+    // parser fix), emit empty run để không crash.
     if run.is_drawing {
+        if let Some((start, end)) = run.byte_range {
+            if end <= original_xml.len() && start <= end {
+                let slice = &original_xml[start..end];
+                // slice là raw bytes UTF-8 của <w:r>...</w:r> nguyên gốc.
+                s.push_str(std::str::from_utf8(slice).unwrap_or(""));
+                return;
+            }
+        }
         s.push_str("<w:r><w:t/></w:r>");
         return;
     }
@@ -116,7 +125,7 @@ fn emit_run(run: &Run, s: &mut String) {
     s.push_str("</w:r>");
 }
 
-fn xml_escape_text(s: &str) -> String {
+pub fn xml_escape_text(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {
         match c {
@@ -129,7 +138,7 @@ fn xml_escape_text(s: &str) -> String {
     out
 }
 
-fn xml_escape_attr(s: &str) -> String {
+pub fn xml_escape_attr(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {
         match c {
