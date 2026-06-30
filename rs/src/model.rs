@@ -27,6 +27,17 @@ pub struct Run {
     /// Khi emit paragraph dirty, mình copy nguyên byte này thay vì tự
     /// tái tạo XML <w:drawing> phức tạp. None cho text run thông thường.
     pub byte_range: Option<(usize, usize)>,
+    /// Tên file ảnh/object thực (vd "image1.png"), resolve từ rel_id qua
+    /// document.xml.rels SAU KHI parse xong (parser không có quyền đọc
+    /// zip rels). None nếu chưa resolve hoặc không phải drawing run.
+    /// Dùng để render placeholder "[IMAGE: image1.png]" thay vì "[IMAGE]".
+    pub media_name: Option<String>,
+    /// XML <w:r>...<w:drawing>...</w:r> tự sinh cho ảnh MỚI chèn (qua lệnh
+    /// insertimage). Khác với ảnh gốc dùng byte_range để copy từ
+    /// original_xml, ảnh mới chưa có trong original_xml nên cần emit từ
+    /// chuỗi này. emit_run ưu tiên byte_range trước, rồi tới drawing_xml.
+    /// None cho run thường và ảnh gốc.
+    pub drawing_xml: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]

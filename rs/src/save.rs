@@ -655,6 +655,8 @@ fn apply_clean_text(p: &mut Paragraph, new_text: &str) {
                 is_drawing: false,
                 rel_id: None,
                 byte_range: None,
+        media_name: None,
+            drawing_xml: None,
             });
             p.dirty = true;
         }
@@ -674,6 +676,8 @@ fn apply_clean_text(p: &mut Paragraph, new_text: &str) {
             is_drawing: false,
             rel_id: None,
             byte_range: None,
+    media_name: None,
+        drawing_xml: None,
         });
     }
     p.dirty = true;
@@ -1101,6 +1105,8 @@ fn apply_text_to_paragraph(p: &mut Paragraph, new_line: &str, old_line: &str) {
                 is_drawing: false,
                 rel_id: None,
                 byte_range: None,
+        media_name: None,
+            drawing_xml: None,
             });
             p.dirty = true;
         }

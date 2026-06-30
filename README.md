@@ -82,6 +82,11 @@ No Microsoft Word, LibreOffice, WPS Office, Python, Java, or OpenXML SDK is requ
 * Extract embedded media automatically
 * Open embedded Excel workbooks inside Vim (when the Excel plugin is installed)
 * Open attachments using the operating system's default application
+* Image runs show their real filename inline (`[IMAGE: photo1.png]`)
+* List every file packed inside the DOCX zip container (`:DocxListZip`)
+* Open any file inside the zip by path, with tab completion (`:DocxOpenFile`)
+* Upload many file types from disk into the DOCX package — images, spreadsheets, documents (docx/doc/odt/rtf/pdf/txt/md), audio, video, archives (`:DocxUpload`)
+* Insert an attachment into the document at the cursor (`:DocxInsertFile`): images are placed as real inline pictures (choose width in cm); other files are inserted as a safe `[📎 name]` marker you can open with `gx`
 
 ### Terminal Image Preview
 
@@ -91,6 +96,7 @@ No Microsoft Word, LibreOffice, WPS Office, Python, Java, or OpenXML SDK is requ
 * Sixel terminal support
 * Automatic fallback to `chafa`
 * Automatic fallback to the system image viewer
+* By default images open in the OS default viewer; set `g:docx_image_open_mode = 'term'` to render inline in supported terminals (kitty/wezterm/sixel/chafa)
 
 ### Hover Information
 
@@ -101,7 +107,7 @@ No Microsoft Word, LibreOffice, WPS Office, Python, Java, or OpenXML SDK is requ
 * Font color
 * Highlight color
 * Paragraph ID
-* Automatic popup on `CursorHold`
+* Shown live on the statusline (updates on every cursor move, never covers the buffer)
 
 ### Rendering
 
@@ -175,6 +181,12 @@ No Microsoft Word, LibreOffice, WPS Office, Python, Java, or OpenXML SDK is requ
 | Preserve Footers             | ✓      |
 | Preserve Comments            | ✓      |
 | Preserve Formatting          | ✓      |
+| Image Filename Display       | ✓      |
+| List Zip Contents            | ✓      |
+| Open Any Zip Entry           | ✓      |
+| Upload Media to Package      | ✓      |
+| Insert Inline Image          | ✓      |
+| Insert File Attachment       | ✓      |
 | DOC Format                   | ✗      |
 | Image Editing                | ✗      |
 | Header Editing               | ✗      |
@@ -186,40 +198,47 @@ No Microsoft Word, LibreOffice, WPS Office, Python, Java, or OpenXML SDK is requ
 
 ## Key Bindings
 
-| Key          | Action                                 |
-| ------------ | -------------------------------------- |
-| `Tab`        | Increase paragraph or list indentation |
-| `Shift-Tab`  | Decrease paragraph or list indentation |
-| `o`          | Insert a new paragraph below           |
-| `O`          | Insert a new paragraph above           |
-| `gx`         | Open embedded image or attachment      |
-| `CursorHold` | Show formatting information popup      |
+| Key          | Action                                              |
+| ------------ | ---------------------------------------------------- |
+| `Tab`        | Increase paragraph or list indentation               |
+| `Shift-Tab`  | Decrease paragraph or list indentation               |
+| `o`          | Insert a new paragraph below                         |
+| `O`          | Insert a new paragraph above                         |
+| `gx`         | Open embedded image, OLE object, or `[📎 name]` attachment marker at the cursor |
+| `gx` (Visual) | Open every image / OLE object / attachment in the selected lines, in order |
+| `<CR>` (Insert mode, table cell) | Insert a new paragraph in the cell instead of a raw newline, to avoid breaking the table border |
+| CursorMoved  | Refresh formatting info on the statusline             |
 
 ---
 
 ## Commands
 
-| Command              | Description                  |
-| -------------------- | ---------------------------- |
-| `:DocxBuild`         | Build the Rust backend       |
-| `:DocxSave`          | Save the current document    |
-| `:DocxGoto`          | Jump to a paragraph          |
-| `:DocxBold`          | Toggle bold                  |
-| `:DocxItalic`        | Toggle italic                |
-| `:DocxFont`          | Change font family           |
-| `:DocxSize`          | Change font size             |
-| `:DocxColor`         | Change font color            |
-| `:DocxHighlight`     | Change text highlight        |
-| `:DocxAlign`         | Change paragraph alignment   |
-| `:DocxIndent`        | Change paragraph indentation |
-| `:DocxListAdd`       | Insert a paragraph below     |
-| `:DocxListAddBefore` | Insert a paragraph above     |
-| `:DocxListDel`       | Delete the current paragraph |
-| `:DocxListEnter`     | Smart Enter for lists        |
-| `:DocxOpen`          | Open embedded media          |
-| `:DocxInfo`          | Show formatting information  |
-| `:DocxGoto`          | Jump to a paragraph          |
-| `:DocxDebug`         | Debug paragraph mapping      |
+| Command              | Description                                       |
+| -------------------- | ---------------------------------------------------- |
+| `:DocxBuild`         | Build the Rust backend                              |
+| `:DocxSave`          | Save the current document                           |
+| `:DocxGoto`          | Jump to a paragraph                                 |
+| `:DocxBold`          | Toggle bold                                         |
+| `:DocxItalic`        | Toggle italic                                       |
+| `:DocxFont`          | Change font family                                  |
+| `:DocxSize`          | Change font size                                    |
+| `:DocxColor`         | Change font color                                   |
+| `:DocxHighlight`     | Change text highlight                               |
+| `:DocxAlign`         | Change paragraph alignment                          |
+| `:DocxIndent`        | Change paragraph indentation                        |
+| `:DocxListAdd`       | Insert a paragraph below                            |
+| `:DocxListAddBefore` | Insert a paragraph above                            |
+| `:DocxListDel`       | Delete the current paragraph                        |
+| `:DocxListEnter`     | Smart Enter for lists                                |
+| `:DocxOpen`          | Open embedded media at the cursor; with a range (`:'<,'>DocxOpen`) opens all media in the selected lines in order |
+| `:DocxInfo`          | Refresh formatting information on the statusline     |
+| `:DocxListZip`       | List every file packed inside the DOCX zip container |
+| `:DocxOpenFile`      | Open any file inside the zip by path (tab completion). Excel & DOCX open in a new Vim tab; text/code files (txt, md, json, py, js, rs, …) open in Vim with modeline disabled for safety; everything else opens in the OS default app |
+| `:DocxUpload`        | Upload file(s) from disk into the DOCX package. Accepts a single file, a folder, or a glob (`:DocxUpload ~/dir/*` uploads every supported file in the folder) |
+| `:DocxInsertFile`    | Insert an attachment at the cursor (`:DocxInsertFile <name> [width_cm]`). Images become real inline pictures; other files become a `[📎 name]` marker openable with `gx` |
+| `:DocxResizeImage`   | Resize the inline image in the current paragraph: `:DocxResizeImage fit` (full page width), `width <cm>` (height auto), or `height <cm>` (width auto) |
+| `:DocxGoto`          | Jump to a paragraph                                 |
+| `:DocxDebug`         | Debug paragraph mapping                             |
 
 ---
 

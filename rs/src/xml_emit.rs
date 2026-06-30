@@ -53,9 +53,10 @@ pub fn emit_paragraph(p: &Paragraph, original_xml: &[u8]) -> String {
 }
 
 fn emit_run(run: &Run, s: &mut String, original_xml: &[u8]) {
-    // Drawing run: copy nguyên byte XML gốc từ original_xml (giữ ảnh,
-    // OLE object, shape). Nếu thiếu byte_range (shouldn't happen sau
-    // parser fix), emit empty run để không crash.
+    // Drawing run: ưu tiên copy nguyên byte XML gốc từ original_xml (ảnh
+    // cũ — giữ ảnh, OLE object, shape). Nếu là ảnh MỚI chèn (insertimage),
+    // không có byte_range mà có drawing_xml tự sinh -> emit chuỗi đó.
+    // Nếu thiếu cả hai (shouldn't happen), emit empty run để không crash.
     if run.is_drawing {
         if let Some((start, end)) = run.byte_range {
             if end <= original_xml.len() && start <= end {
@@ -64,6 +65,10 @@ fn emit_run(run: &Run, s: &mut String, original_xml: &[u8]) {
                 s.push_str(std::str::from_utf8(slice).unwrap_or(""));
                 return;
             }
+        }
+        if let Some(xml) = &run.drawing_xml {
+            s.push_str(xml);
+            return;
         }
         s.push_str("<w:r><w:t/></w:r>");
         return;

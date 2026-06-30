@@ -5,7 +5,8 @@
 //! - Paragraph trong sdt: prefix '┊ '.
 //! - Heading: prefix '# '/'## '/'### ' theo level.
 //! - Bullet: prefix '• '. Numbered: '1. '.
-//! - Image run (is_drawing=true): hiển thị "[IMAGE]" trong nội dung.
+//! - Image run (is_drawing=true): hiển thị "[IMAGE: <tên file>]" trong nội
+//!   dung (tên file resolve từ rels; fallback "[IMAGE]" nếu không có tên).
 //!
 //! Metadata blocks @@STYLE@@ và @@PARAMAP@@ y hệt design cũ. Số dòng buffer
 //! = số paragraph + số row separator (1 dòng cho mỗi <w:tr> kết thúc).
@@ -13,6 +14,16 @@
 use crate::model::*;
 use crate::numbering::LvlTemplate;
 use std::collections::HashMap;
+
+/// Sinh placeholder text cho 1 drawing run. Nếu có media_name (resolve
+/// được từ rels) -> "[IMAGE: ten_file.png]"; nếu không -> "[IMAGE]"
+/// (fallback an toàn khi rels không đọc được hoặc rel_id không match).
+fn image_placeholder(run: &Run) -> String {
+    match &run.media_name {
+        Some(name) => format!("[IMAGE: {name}]"),
+        None => "[IMAGE]".to_string(),
+    }
+}
 
 pub struct Rendered {
     pub text: String,
@@ -71,7 +82,7 @@ fn render_cell_content(
 
     for run in &p.runs {
         if run.is_drawing {
-            let placeholder = "[IMAGE]";
+            let placeholder = image_placeholder(run);
             let cstart = cell_start_char + char_cursor;
             let cend = cstart + placeholder.chars().count() - 1;
             if !run.style.is_default() {
@@ -84,7 +95,7 @@ fn render_cell_content(
                     run.style.highlight.clone(),
                 ));
             }
-            s.push_str(placeholder);
+            s.push_str(&placeholder);
             char_cursor += placeholder.chars().count();
             continue;
         }
@@ -121,7 +132,7 @@ fn paragraph_text_length(p: &Paragraph) -> usize {
     let mut total = 0usize;
     for run in &p.runs {
         if run.is_drawing {
-            total += "[IMAGE]".chars().count();
+            total += image_placeholder(run).chars().count();
         } else {
             total += run.text.chars().count();
         }
@@ -479,7 +490,9 @@ pub fn render(
         out.push('\n');
         buffer_line += 1;
     }
-    let _ = in_table_depth;
+    // buffer_line/in_table_depth không còn được đọc sau điểm này — discard
+    // tường minh để tắt warning unused_assignments.
+    let _ = buffer_line;
     let _ = in_table_depth;
 
     if out.ends_with('\n') {
@@ -555,7 +568,7 @@ fn render_paragraph(
         let mut char_cursor_in_cell = prefix_chars_in_cell;
         for run in &p.runs {
             if run.is_drawing {
-                let placeholder = "[IMAGE]";
+                let placeholder = image_placeholder(run);
                 let cstart = cell_text_start_char_in_line - prefix_chars_in_cell + char_cursor_in_cell + 1;
                 let cend = cstart + placeholder.chars().count() - 1;
                 if !run.style.is_default() {
@@ -568,7 +581,7 @@ fn render_paragraph(
                         run.style.highlight.clone(),
                     ));
                 }
-                out.push_str(placeholder);
+                out.push_str(&placeholder);
                 char_cursor_in_cell += placeholder.chars().count();
                 continue;
             }
@@ -652,7 +665,7 @@ fn render_paragraph(
     let text_only_chars: usize = p
         .runs
         .iter()
-        .map(|r| if r.is_drawing { 7 } else { r.text.chars().count() })
+        .map(|r| if r.is_drawing { image_placeholder(r).chars().count() } else { r.text.chars().count() })
         .sum();
     let content_chars = context_prefix.chars().count()
         + indent_prefix.chars().count()
@@ -695,10 +708,10 @@ fn render_paragraph(
 
     for run in &p.runs {
         if run.is_drawing {
-            let placeholder = "[IMAGE]";
+            let placeholder = image_placeholder(run);
             let cstart = char_cursor + 1;
             let cend = char_cursor + placeholder.chars().count();
-            out.push_str(placeholder);
+            out.push_str(&placeholder);
             char_cursor += placeholder.chars().count();
             if !run.style.is_default() {
                 let size_pt = run.style.size_half_pt.map(|h| h as f32 / 2.0);

@@ -93,7 +93,9 @@ function! DocxSetupHighlight()
     highlight DocxBorder guifg=#9ca0b0 ctermfg=245
     highlight DocxLink   guifg=#0000ff ctermfg=12 gui=underline cterm=underline
     highlight DocxHeading gui=bold cterm=bold
-    " Highlight group cho popup hover: nền tối hơn buffer, border subtle.
+    " Highlight group cho hover info (KHÔNG còn dùng cho popup — hover info
+    " giờ hiển thị trên statusline; giữ định nghĩa để tránh lỗi nếu code cũ
+    " còn tham chiếu, và để user có thể tận dụng cho mục đích khác).
     highlight default DocxHoverPopup  guibg=#2d2d3a guifg=#e0e0e0 ctermbg=237 ctermfg=255
     highlight default DocxHoverBorder guifg=#7080a0 ctermfg=103
     " --- Viền bảng / structural markers: + | - và các box-drawing chars ---
@@ -495,6 +497,7 @@ function! s:DocxLoadIntoBuffer(raw_output) abort
         call setpos('.', l:save_pos)
     endif
     call s:DocxUpdateStatusPara()
+    call DocxHoverInfo()
 endfunction
 " ----------------------------------------------------------------------------
 " s:DocxUpdateStatusPara(): cập nhật b:docx_status_para với paragraph_id tại
@@ -530,6 +533,37 @@ endfunction
 " ----------------------------------------------------------------------------
 function! s:DocxIsExcelFile(path) abort
     return a:path =~? '\.\(xlsx\|xlsm\|xls\)$'
+endfunction
+" ----------------------------------------------------------------------------
+" Kiểm tra file DOCX (mở bằng tab Vim khác — plugin tự render qua BufReadCmd)
+" ----------------------------------------------------------------------------
+function! s:DocxIsDocxFile(path) abort
+    return a:path =~? '\.docx$'
+endfunction
+" ----------------------------------------------------------------------------
+" Kiểm tra file văn bản/code nên mở thẳng bằng Vim. Bao gồm văn bản thuần
+" (txt/md/csv...), file cấu hình (json/yaml/toml/ini...), và source code
+" (py/js/rs/c/go/...). Cũng nhận 1 số file KHÔNG có extension theo tên quen
+" thuộc (Makefile, Dockerfile, LICENSE, README...).
+" ----------------------------------------------------------------------------
+function! s:DocxIsVimTextFile(path) abort
+    let l:ext_pat = '\.\(' .
+                \ 'csv\|tsv\|txt\|md\|markdown\|log\|rst\|adoc\|org\|tex\|' .
+                \ 'json\|yaml\|yml\|toml\|ini\|cfg\|conf\|env\|properties\|' .
+                \ 'xml\|html\|htm\|css\|scss\|less\|' .
+                \ 'js\|jsx\|ts\|tsx\|mjs\|cjs\|' .
+                \ 'py\|rb\|rs\|go\|c\|h\|cpp\|cc\|cxx\|hpp\|hh\|' .
+                \ 'java\|kt\|kts\|swift\|mm\|php\|pl\|pm\|' .
+                \ 'sh\|bash\|zsh\|fish\|vim\|lua\|sql\|r\|jl\|' .
+                \ 'dart\|scala\|clj\|ex\|exs\|erl\|hs\|ml\|mli\|fs\|vb\|cs\|' .
+                \ 'gradle\|bat\|ps1\|ipynb\|diff\|patch' .
+                \ '\)$'
+    if a:path =~? l:ext_pat
+        return 1
+    endif
+    " File không extension nhưng tên quen thuộc -> vẫn là text.
+    let l:base = fnamemodify(a:path, ':t')
+    return l:base =~? '^\(Makefile\|Dockerfile\|LICENSE\|README\|CHANGELOG\|\.gitignore\|\.env\|\.bashrc\|\.vimrc\)$'
 endfunction
 " ----------------------------------------------------------------------------
 " DocxGoto(ref): nhảy con trỏ đến paragraph có id `ref` (vd "P3").
@@ -631,19 +665,19 @@ function! s:DocxSetupBufferOptions() abort
     setlocal bufhidden=hide
     setlocal noswapfile
     setlocal filetype=docx
-    " Statusline: hiển thị paragraph_id tại cursor + tên file.
-    " Thông tin KHÔNG nằm trong buffer text -> yank/copy an toàn.
-    setlocal statusline=%{DocxStatusLine()}\ —\ %f%=%l,%c\ \ %P
+    " Statusline: hiển thị paragraph_id + thông tin style tại cursor +
+    " tên file. Thông tin KHÔNG nằm trong buffer text -> yank/copy an toàn.
+    setlocal statusline=%{DocxStatusLine()}\ —\ %{DocxHoverStatusLine()}\ —\ %f%=%l,%c\ \ %P
     augroup DocxBuffer
         autocmd! * <buffer>
         autocmd BufWriteCmd <buffer> call DocxSave()
         autocmd CursorMoved,CursorMovedI <buffer> call s:DocxUpdateStatusPara()
-        " Khi cursor di chuyển: đóng popup hover (nếu đang mở). Mở lại
-        " sau khi idle (CursorHold).
-        autocmd CursorMoved,CursorMovedI,BufLeave,WinLeave <buffer> call s:DocxClosePopup()
-        " CursorHold: sau khi cursor idle 'updatetime' ms, hiển thị popup
-        " với thông tin font/size/bold/italic/color/highlight.
-        autocmd CursorHold <buffer> call DocxHoverInfo()
+        " Cập nhật thông tin style trên statusline khi cursor di chuyển
+        " (thay cho popup hover cũ trên CursorHold — hiển thị ngay, không
+        " che nội dung buffer). Chỉ dùng CursorMoved (Normal mode), KHÔNG
+        " dùng CursorMovedI: tránh tính lại + redrawstatus mỗi keystroke
+        " khi đang gõ (gây nháy/chậm trên file lớn).
+        autocmd CursorMoved <buffer> call DocxHoverInfo()
     augroup END
     " Mapping Tab / Shift-Tab cho indent (local-to-buffer):
     nnoremap <silent> <buffer> <Tab>   :call DocxSmartTab('+1', line('.'), line('.'))<CR>
@@ -660,6 +694,59 @@ function! s:DocxSetupBufferOptions() abort
     " `gx` Normal mode: nếu cursor trên paragraph chứa [IMAGE] / OLE
     " object → extract media ra /tmp/ và mở bằng app mặc định OS.
     nnoremap <silent> <buffer> gx :call DocxOpenMedia()<CR>
+    " Visual mode gx: mở HÀNG LOẠT mọi media/đính kèm/OLE trong vùng chọn
+    " theo thứ tự từ trên xuống.
+    xnoremap <silent> <buffer> gx :<C-u>call DocxOpenMediaRange(line("'<"), line("'>"))<CR>
+    " Insert mode <CR> trên dòng table (bắt đầu bằng `│`): CHẶN raw
+    " newline. Gõ Enter giữa text trong cell sẽ tách dòng buffer thành 2
+    " dòng KHÔNG có border `│...│` -> save logic coi dòng mới là "ngoài
+    " table" -> bảng bị vỡ ngay khi hiển thị (trước cả khi save). Thay
+    " vào đó: thoát Insert, chèn 1 paragraph mới đúng cách trong cùng cell
+    " qua DocxListAdd() (xử lý qua binary, giữ border nguyên vẹn).
+    " Dùng <expr> để quyết định runtime: dòng table -> route DocxListAdd,
+    " dòng thường -> <CR> mặc định.
+    inoremap <buffer> <expr> <CR> <SID>DocxSmartCR()
+endfunction
+" ----------------------------------------------------------------------------
+" s:DocxSmartCR(): trả về keys thay cho <CR> gốc khi gõ Enter trong Insert
+" mode trên buffer DOCX. Trên dòng table -> chèn paragraph mới trong cell
+" qua DocxListAdd() (text bên PHẢI con trỏ KHÔNG được tách sang dòng mới —
+" giống hành vi `o`, không phải Enter true split — trade-off chấp nhận
+" được để tránh vỡ format bảng). Dòng thường -> <CR> bình thường.
+"
+" Lưu ý: trả về chuỗi keys (không tự gọi hàm trong lúc evaluate) để tương
+" thích với hạn chế của <expr> mapping (không được sửa buffer trực tiếp
+" trong khi đang evaluate expression).
+" ----------------------------------------------------------------------------
+function! s:DocxSmartCR() abort
+    if getline('.') =~# '^│'
+        " Trên dòng table: thoát Insert -> SAVE buffer hiện tại xuống file
+        " (để text user vừa gõ trong cell không bị mất, vì DocxListAdd
+        " thao tác trên file gốc qua binary chứ không trên buffer chưa
+        " save) -> chèn paragraph mới trong cell.
+        return "\<Esc>:call DocxSmartEnterInTable()\<CR>"
+    endif
+    return "\<CR>"
+endfunction
+" ----------------------------------------------------------------------------
+" DocxSmartEnterInTable(): xử lý Enter trong cell bảng — save buffer (nếu
+" có thay đổi) rồi chèn paragraph mới. Tách riêng để gọi sau khi <Esc>
+" về Normal mode (không thể save+reload buffer an toàn ngay trong <expr>).
+" ----------------------------------------------------------------------------
+function! DocxSmartEnterInTable() abort
+    " Save text user đang gõ trong cell trước (DocxSave reload buffer +
+    " set nomodified). Chỉ save khi buffer thực sự bị sửa, tránh round-trip
+    " thừa khi cell rỗng.
+    if &modified
+        call DocxSave()
+        " Nếu save FAIL, buffer vẫn còn 'modified' -> dừng, không chèn
+        " paragraph mới (tránh thao tác tiếp trên trạng thái không chắc
+        " chắn). DocxSave đã echoerr lý do.
+        if &modified
+            return
+        endif
+    endif
+    call DocxListAdd()
 endfunction
 " ----------------------------------------------------------------------------
 " DocxOpen(): đọc file .docx qua binary, hiển thị nội dung text trong buffer
@@ -895,24 +982,6 @@ function! DocxHighlight(color, line1, line2) abort
     endif
 endfunction
 " ----------------------------------------------------------------------------
-" DocxHoverInfo(): hiển thị thông tin style tại con trỏ trong 1 popup nhỏ
-" cạnh cursor (nếu Vim/Neovim hỗ trợ), fallback về echo nếu không.
-" ----------------------------------------------------------------------------
-let s:docx_popup_id = 0
-function! s:DocxClosePopup() abort
-    if has('nvim')
-        if s:docx_popup_id != 0
-            silent! call nvim_win_close(s:docx_popup_id, 1)
-            let s:docx_popup_id = 0
-        endif
-    else
-        if s:docx_popup_id != 0
-            silent! call popup_close(s:docx_popup_id)
-            let s:docx_popup_id = 0
-        endif
-    endif
-endfunction
-" ----------------------------------------------------------------------------
 " s:DocxBuildHoverText(): build danh sách dòng text mô tả style tại cursor.
 " Trả về [] nếu không có gì để hiện.
 " ----------------------------------------------------------------------------
@@ -964,52 +1033,32 @@ function! s:DocxBuildHoverText() abort
     return l:lines
 endfunction
 " ----------------------------------------------------------------------------
-" DocxHoverInfo(): main entry — gọi từ CursorHold autocmd hoặc :DocxInfo.
+" b:docx_hover_text: cache dòng hover hiện tại, đọc bởi DocxHoverStatusLine()
+" để hiển thị trên statusline (thay cho popup cũ).
+" ----------------------------------------------------------------------------
+" DocxHoverStatusLine(): hàm gọi từ 'statusline' để hiển thị thông tin
+" style tại cursor (font/size/bold/italic/color/highlight), gộp 1 dòng
+" duy nhất bằng ' | '. Thay thế cho popup hover cũ — không che nội dung,
+" không cần đóng/mở theo CursorMoved.
+" ----------------------------------------------------------------------------
+function! DocxHoverStatusLine() abort
+    if !exists('b:docx_file')
+        return ''
+    endif
+    let l:lines = get(b:, 'docx_hover_text', [])
+    return empty(l:lines) ? '' : join(l:lines, ' | ')
+endfunction
+" ----------------------------------------------------------------------------
+" DocxHoverInfo(): main entry — gọi từ CursorMoved/CursorHold autocmd hoặc
+" :DocxInfo. Cập nhật b:docx_hover_text rồi redraw statusline (KHÔNG mở
+" popup nữa — hiển thị ngay trên statusline để không che buffer).
 " ----------------------------------------------------------------------------
 function! DocxHoverInfo() abort
-    call s:DocxClosePopup()
-    let l:lines = s:DocxBuildHoverText()
-    if empty(l:lines)
-        return
-    endif
-
-    if has('nvim')
-        let l:buf = nvim_create_buf(v:false, v:true)
-        call nvim_buf_set_lines(l:buf, 0, -1, v:true, l:lines)
-        let l:width = 10
-        for l:l in l:lines
-            if strdisplaywidth(l:l) > l:width
-                let l:width = strdisplaywidth(l:l)
-            endif
-        endfor
-        let l:opts = {
-                    \ 'relative': 'cursor',
-                    \ 'row': 1,
-                    \ 'col': 1,
-                    \ 'width': l:width + 2,
-                    \ 'height': len(l:lines),
-                    \ 'style': 'minimal',
-                    \ 'border': 'rounded',
-                    \ 'focusable': v:false,
-                    \ }
-        let s:docx_popup_id = nvim_open_win(l:buf, v:false, l:opts)
-        call nvim_win_set_option(s:docx_popup_id, 'winhl', 'Normal:DocxHoverPopup,FloatBorder:DocxHoverBorder')
-    elseif exists('*popup_create')
-        let l:opts = {
-                    \ 'pos': 'topleft',
-                    \ 'line': 'cursor+1',
-                    \ 'col': 'cursor+1',
-                    \ 'border': [1, 1, 1, 1],
-                    \ 'padding': [0, 1, 0, 1],
-                    \ 'highlight': 'DocxHoverPopup',
-                    \ 'borderhighlight': ['DocxHoverBorder'],
-                    \ 'moved': 'any',
-                    \ 'close': 'click',
-                    \ }
-        let s:docx_popup_id = popup_create(l:lines, l:opts)
-    else
-        echo join(l:lines, ' | ')
-    endif
+    let b:docx_hover_text = s:DocxBuildHoverText()
+    " Trigger statusline redraw ngay (không cần đợi tới event tiếp theo).
+    " silent! vì redrawstatus có thể lỗi nếu gọi trong context không cho
+    " phép redraw (vd ngay khi buffer chưa vẽ xong lúc load đầu tiên).
+    silent! redrawstatus
 endfunction
 " ----------------------------------------------------------------------------
 " MEDIA / ATTACHMENT - mở image, OLE object bằng app mặc định OS
@@ -1059,55 +1108,778 @@ function! s:DocxRenderImageInTerm(path) abort
     execute '!' . l:cmd
     return 1
 endfunction
+" Mặc định 'os': ảnh mở bằng app mặc định của hệ thống (Preview/xdg-open/
+" Windows shell). Đặt 'term' nếu muốn render inline trong terminal hỗ trợ
+" (kitty/wezterm/sixel/chafa) — lưu ý chế độ term dùng `:!` có thể lỗi
+" "/dev/tty: device not configured" trên một số cấu hình GUI/embedded.
 if !exists('g:docx_image_open_mode')
-    let g:docx_image_open_mode = 'auto'
+    let g:docx_image_open_mode = 'os'
 endif
+" ----------------------------------------------------------------------------
+" s:DocxAttachmentNameAtLine(line_str): nếu dòng chứa marker đính kèm dạng
+" "[📎 tên_file]", trả về tên file; ngược lại trả ''. Marker do
+" :DocxInsertFile chèn (binary insertfile).
+" ----------------------------------------------------------------------------
+function! s:DocxAttachmentNameAtLine(line_str) abort
+    " 📎 = U+1F4CE (decimal 128206). Match "[📎 <tên>]" — tên tới ký tự `]`.
+    let l:m = matchlist(a:line_str, '\[\%(\%d128206\)\s*\([^]]\+\)\]')
+    if empty(l:m)
+        return ''
+    endif
+    return trim(l:m[1])
+endfunction
+" ----------------------------------------------------------------------------
+" s:DocxOpenAttachment(name): mở file đính kèm theo tên. Tìm trong
+" word/embeddings/<name> trước, rồi word/media/<name>. Extract ra /tmp rồi
+" mở theo quy tắc s:DocxOpenExtractedFile (excel/docx -> tab vim,
+" csv/txt -> vim, còn lại -> app hệ thống).
+" ----------------------------------------------------------------------------
+function! s:DocxOpenAttachment(name) abort
+    for l:dir in ['word/embeddings/', 'word/media/']
+        let l:entry = l:dir . a:name
+        let l:result = s:DocxCmd('extractentry', l:entry)
+        if !v:shell_error
+            let l:path = get(l:result, 0, '')
+            if !empty(l:path)
+                call s:DocxOpenExtractedFile(l:path)
+                return
+            endif
+        endif
+    endfor
+    echoerr 'Attachment not found in package: ' . a:name . ' (đã upload chưa? thử :DocxListZip)'
+endfunction
+" ----------------------------------------------------------------------------
+" s:DocxOpenAtLine(line, seen): mở mọi media/đính kèm/OLE tại 1 dòng.
+"   - line: số dòng buffer.
+"   - seen: Dict para_id đã xử lý (tránh mở trùng cùng paragraph khi nó
+"     trải nhiều dòng, vd table cell). Hàm tự cập nhật seen.
+" Trả về số file đã mở từ dòng này. KHÔNG echoerr khi dòng không có gì
+" (để dùng trong vòng lặp range mà không spam lỗi) — chỉ trả 0.
+" ----------------------------------------------------------------------------
+function! s:DocxOpenAtLine(line, seen) abort
+    " 1. Marker đính kèm "[📎 tên]" trên dòng này?
+    let l:attach = s:DocxAttachmentNameAtLine(getline(a:line))
+    if !empty(l:attach)
+        call s:DocxOpenAttachment(l:attach)
+        return 1
+    endif
+    " 2. Media/OLE của paragraph chứa dòng này. Tránh trùng paragraph.
+    let l:pid = s:DocxParaIdAtLine(a:line)
+    if empty(l:pid) || has_key(a:seen, l:pid)
+        return 0
+    endif
+    let a:seen[l:pid] = 1
+    let l:result = s:DocxCmd('extract', l:pid)
+    if v:shell_error
+        " 'no extractable media' -> dòng không có gì để mở, bỏ qua im lặng.
+        return 0
+    endif
+    let l:count = 0
+    for l:path in l:result
+        if empty(l:path)
+            continue
+        endif
+        call s:DocxOpenExtractedFile(l:path)
+        let l:count += 1
+    endfor
+    return l:count
+endfunction
 function! DocxOpenMedia() abort
+    " Mở media/đính kèm/OLE tại dòng cursor hiện tại (Normal mode).
+    let l:seen = {}
+    let l:n = s:DocxOpenAtLine(line('.'), l:seen)
+    if l:n == 0
+        echo 'No image/object/attachment on this line'
+    endif
+endfunction
+" ----------------------------------------------------------------------------
+" DocxOpenMediaRange(line1, line2): mở HÀNG LOẠT mọi media/đính kèm/OLE
+" trong vùng [line1, line2] theo THỨ TỰ từ trên xuống (Visual mode). Mỗi
+" paragraph chỉ mở 1 lần dù trải nhiều dòng. Báo tổng số file đã mở.
+" ----------------------------------------------------------------------------
+function! DocxOpenMediaRange(line1, line2) abort
+    let l:seen = {}
+    let l:total = 0
+    let l:lo = a:line1 <= a:line2 ? a:line1 : a:line2
+    let l:hi = a:line1 <= a:line2 ? a:line2 : a:line1
+    " Lưu buffer + nội dung dòng vùng chọn TRƯỚC vòng lặp. Lý do: mở
+    " excel/docx sẽ `tabnew` sang buffer khác, làm getline()/DocxParaIdAtLine
+    " đọc nhầm buffer. Ta đọc trước toàn bộ dòng cần xử lý + para_id, rồi
+    " mới mở; nếu mở làm chuyển tab thì quay lại buffer gốc trước khi xử lý
+    " dòng kế.
+    let l:home_buf = bufnr('%')
+    let l:home_win = win_getid()
+    let l:ln = l:lo
+    while l:ln <= l:hi
+        " Đảm bảo đang ở buffer gốc trước khi đọc/xử lý dòng này.
+        if bufnr('%') != l:home_buf
+            if win_gotoid(l:home_win) == 0
+                " Window gốc mất (hiếm) -> nhảy buffer trực tiếp.
+                execute 'buffer ' . l:home_buf
+            endif
+        endif
+        let l:total += s:DocxOpenAtLine(l:ln, l:seen)
+        let l:ln += 1
+    endwhile
+    " Quay về buffer gốc khi xong (nếu lần mở cuối nhảy tab).
+    if bufnr('%') != l:home_buf && win_gotoid(l:home_win) == 0
+        execute 'buffer ' . l:home_buf
+    endif
+    if l:total == 0
+        echo 'No image/object/attachment in selection'
+    else
+        echo 'Opened ' . l:total . ' file(s) from selection'
+    endif
+endfunction
+" ----------------------------------------------------------------------------
+" s:DocxOpenCmd(line1, line2, range): dispatcher cho :DocxOpen.
+"   - range == 0 (không có range, vd :DocxOpen): mở dòng cursor.
+"   - range > 0 (có range, vd :'<,'>DocxOpen hoặc :5,10DocxOpen): mở hàng loạt.
+" ----------------------------------------------------------------------------
+function! s:DocxOpenCmd(line1, line2, range) abort
+    if a:range == 0
+        call DocxOpenMedia()
+    else
+        call DocxOpenMediaRange(a:line1, a:line2)
+    endif
+endfunction
+" ----------------------------------------------------------------------------
+" s:DocxOpenTextSafe(path): mở 1 file text/code trong tab Vim mới với
+" modeline TẮT. Lý do bảo mật: file đính kèm có thể không đáng tin và chứa
+" modeline (vd dòng "/* vim: set ... */") — Vim sẽ thực thi 1 số lệnh từ
+" modeline khi mở, là vector tấn công. Tắt 'modeline' global trong lúc đọc
+" (modeline xử lý lúc load file), rồi khôi phục; set thêm nomodeline cục bộ.
+" ----------------------------------------------------------------------------
+function! s:DocxOpenTextSafe(path) abort
+    let l:save_ml = &modeline
+    set nomodeline
+    try
+        execute '$tabnew ' . fnameescape(a:path)
+        setlocal nomodeline
+    finally
+        let &modeline = l:save_ml
+    endtry
+endfunction
+" ----------------------------------------------------------------------------
+" s:DocxOpenExtractedFile(path): mở 1 file đã extract ra /tmp theo quy tắc:
+"   - File Excel + có Excel plugin -> mở trong 1 tab Vim khác.
+"   - Ảnh + g:docx_image_open_mode == 'term' -> thử render inline terminal.
+"   - Còn lại (mặc định) -> mở bằng app mặc định của hệ thống.
+" Dùng chung cho DocxOpenMedia (gx / :DocxOpen) và DocxOpenFile.
+" ----------------------------------------------------------------------------
+function! s:DocxOpenExtractedFile(path) abort
+    let l:fname = fnamemodify(a:path, ':t')
+    " Excel -> tab Vim khác (nếu Excel plugin có sẵn).
+    if s:DocxHasXlsxPlugin() && s:DocxIsExcelFile(a:path)
+        execute '$tabnew ' . fnameescape(a:path)
+        echo 'Opened in Vim tab: ' . l:fname . ' (' . a:path . ')'
+        return
+    endif
+    " DOCX -> tab Vim khác. Plugin này tự render qua autocmd BufReadCmd
+    " *.docx, nên mở file .docx trong tab mới sẽ hiển thị như 1 doc editable.
+    if s:DocxIsDocxFile(a:path)
+        execute '$tabnew ' . fnameescape(a:path)
+        echo 'Opened in Vim tab (DOCX): ' . l:fname . ' (' . a:path . ')'
+        return
+    endif
+    " File text/code -> mở thẳng bằng Vim trong tab mới. RISK: file đính kèm
+    " có thể không đáng tin và chứa modeline độc (vd 'vim: set ...') thực thi
+    " lệnh khi mở. Tắt modeline khi đọc để chặn (s:DocxOpenTextSafe).
+    if s:DocxIsVimTextFile(a:path)
+        call s:DocxOpenTextSafe(a:path)
+        echo 'Opened in Vim tab: ' . l:fname . ' (' . a:path . ')'
+        return
+    endif
+    " Ảnh + chế độ 'term' (opt-in) -> thử inline terminal render.
+    if s:DocxIsImageFile(a:path) && g:docx_image_open_mode ==# 'term'
+        if s:DocxRenderImageInTerm(a:path)
+            echo l:fname . ' (' . a:path . ')'
+            return
+        endif
+        echoerr 'Terminal inline image failed. Set g:docx_image_open_mode = "os" to use the system viewer.'
+        return
+    endif
+    " Mặc định (PDF, DOC, RTF, ODT, âm thanh, video, nén, ảnh...): mở bằng
+    " app mặc định của hệ thống.
+    let l:opener = s:DocxSystemOpenCmd()
+    if has('win32') || has('win64')
+        silent! call system(l:opener . ' ' . shellescape(a:path))
+    else
+        call system(l:opener . ' ' . shellescape(a:path) . ' &')
+    endif
+    echo 'Opened: ' . l:fname . ' (' . a:path . ')'
+endfunction
+" ----------------------------------------------------------------------------
+" DocxListZip(): liệt kê toàn bộ file (entry) có trong zip DOCX, hiển thị
+" trong 1 scratch buffer (size + path), tương tự `unzip -l`.
+" ----------------------------------------------------------------------------
+function! DocxListZip() abort
+    if !exists('b:docx_file')
+        echoerr 'This buffer is not a DOCX file'
+        return
+    endif
+    let l:result = s:DocxCmd('listzip')
+    if v:shell_error
+        echoerr join(l:result, "\n")
+        return
+    endif
+    " Cache danh sách entry path (không kèm size) cho completion của
+    " :DocxOpenFile.
+    let b:docx_zip_entries = []
+    let l:display = []
+    for l:line in l:result
+        let l:parts = split(l:line, "\t")
+        if len(l:parts) != 2
+            continue
+        endif
+        call add(b:docx_zip_entries, l:parts[1])
+        call add(l:display, printf('%10s  %s', l:parts[0], l:parts[1]))
+    endfor
+    " Hiển thị trong scratch buffer riêng (split ngang dưới).
+    botright new
+    setlocal buftype=nofile bufhidden=wipe noswapfile nobuflisted
+    " setline TRƯỚC khi khóa nomodifiable (nếu khóa trước sẽ lỗi
+    " "Cannot make changes, 'modifiable' is off").
+    call setline(1, ['Size (bytes)   Entry path in DOCX zip', repeat('-', 50)] + l:display)
+    setlocal nomodified
+    setlocal nomodifiable
+    resize 12
+endfunction
+" ----------------------------------------------------------------------------
+" DocxOpenFileComplete(): Tab completion cho :DocxOpenFile, dùng cache
+" b:docx_zip_entries (set bởi :DocxListZip). Nếu chưa từng gọi DocxListZip,
+" tự động gọi binary 1 lần để build cache.
+" ----------------------------------------------------------------------------
+function! DocxOpenFileComplete(A, L, P) abort
+    if !exists('b:docx_zip_entries')
+        if !exists('b:docx_file')
+            return []
+        endif
+        let l:result = s:DocxCmd('listzip')
+        if v:shell_error
+            return []
+        endif
+        let b:docx_zip_entries = []
+        for l:line in l:result
+            let l:parts = split(l:line, "\t")
+            if len(l:parts) == 2
+                call add(b:docx_zip_entries, l:parts[1])
+            endif
+        endfor
+    endif
+    return filter(copy(b:docx_zip_entries), 'v:val =~? a:A')
+endfunction
+" ----------------------------------------------------------------------------
+" DocxOpenFile(entry_name): extract 1 entry bất kỳ trong zip DOCX ra /tmp
+" rồi mở bằng ứng dụng mặc định OS. Nếu là file Excel VÀ Excel plugin có
+" sẵn -> mở trong 1 tab Vim khác (giống cách media Excel hiện tại mở).
+" ----------------------------------------------------------------------------
+function! DocxOpenFile(entry_name) abort
+    if !exists('b:docx_file')
+        echoerr 'This buffer is not a DOCX file'
+        return
+    endif
+    let l:entry = trim(a:entry_name)
+    if empty(l:entry)
+        echoerr 'Usage: :DocxOpenFile <entry-path-in-zip>'
+        return
+    endif
+    let l:result = s:DocxCmd('extractentry', l:entry)
+    if v:shell_error
+        echoerr join(l:result, "\n")
+        return
+    endif
+    let l:path = get(l:result, 0, '')
+    if empty(l:path)
+        echoerr 'Extract produced no output'
+        return
+    endif
+    call s:DocxOpenExtractedFile(l:path)
+endfunction
+" ----------------------------------------------------------------------------
+" s:DocxUploadAcceptPattern(): regex (very magic-free) khớp các extension
+" file được chấp nhận upload. Dùng chung cho completion + lọc batch glob.
+" ----------------------------------------------------------------------------
+function! s:DocxUploadAcceptPattern() abort
+    return '\.\(' .
+                \ 'png\|jpg\|jpeg\|gif\|bmp\|webp\|tif\|tiff\|svg\|' .
+                \ 'xlsx\|xlsm\|xls\|ods\|csv\|tsv\|' .
+                \ 'docx\|doc\|odt\|rtf\|pdf\|txt\|md\|markdown\|' .
+                \ 'mp3\|wav\|ogg\|flac\|m4a\|aac\|' .
+                \ 'mp4\|mov\|avi\|mkv\|webm\|wmv\|' .
+                \ 'zip\|rar\|7z\|gz\|tar\|' .
+                \ 'log\|rst\|adoc\|org\|tex\|json\|yaml\|yml\|toml\|ini\|cfg\|conf\|env\|properties\|' .
+                \ 'xml\|html\|htm\|css\|scss\|less\|js\|jsx\|ts\|tsx\|mjs\|cjs\|' .
+                \ 'py\|rb\|rs\|go\|c\|h\|cpp\|cc\|cxx\|hpp\|hh\|java\|kt\|kts\|swift\|mm\|php\|pl\|pm\|' .
+                \ 'sh\|bash\|zsh\|fish\|vim\|lua\|sql\|r\|jl\|dart\|scala\|clj\|ex\|exs\|erl\|hs\|ml\|mli\|fs\|vb\|cs\|' .
+                \ 'gradle\|bat\|ps1\|ipynb\|diff\|patch' .
+                \ '\)$'
+endfunction
+" ----------------------------------------------------------------------------
+" DocxUpload(src_path): thêm file từ hệ thống vào package DOCX. Hỗ trợ:
+"   - 1 file:     :DocxUpload ~/anh.png
+"   - wildcard:   :DocxUpload ~/folder/*        (mọi file accept trong folder)
+"   - thư mục:    :DocxUpload ~/folder           (tự coi như folder/*)
+"   - glob khác:  :DocxUpload ~/folder/*.png     (chỉ png)
+" Khi nhiều file -> upload lần lượt, bỏ qua file không accept, báo tổng kết.
+" ----------------------------------------------------------------------------
+function! DocxUpload(src_path) abort
+    if !exists('b:docx_file')
+        echoerr 'This buffer is not a DOCX file'
+        return
+    endif
+    let l:raw = trim(a:src_path)
+    if empty(l:raw)
+        echoerr 'Usage: :DocxUpload <path | glob | folder>'
+        return
+    endif
+    " Chỉ mở rộng ~ ở đầu path (home dir), KHÔNG để expand() tự glob
+    " wildcard (nếu dùng expand() trên path có '*' nó sẽ tự nối nhiều file
+    " thành 1 chuỗi nhiều dòng -> hỏng glob/isdirectory phía dưới).
+    let l:p = l:raw
+    if l:p ==# '~' || l:p =~# '^\~/'
+        let l:p = fnamemodify('~', ':p:h') . strpart(l:p, 1)
+    endif
+    " Thư mục -> thêm /* để lấy toàn bộ file con.
+    if isdirectory(l:p)
+        let l:p = substitute(l:p, '/\=$', '/*', '')
+    endif
+    let l:expanded = l:p
+    " glob() expand wildcard thành danh sách path (list). File đơn không
+    " wildcard -> trả chính nó nếu tồn tại.
+    let l:matches = glob(l:expanded, 0, 1)
+    if empty(l:matches) && filereadable(l:expanded)
+        let l:matches = [l:expanded]
+    endif
+    if empty(l:matches)
+        " Chẩn đoán: path sai vs thư mục rỗng.
+        let l:dir = l:expanded =~# '/\*\+$'
+                    \ ? substitute(l:expanded, '/\*\+$', '', '')
+                    \ : fnamemodify(l:expanded, ':h')
+        if !empty(l:dir) && !isdirectory(l:dir) && !filereadable(l:expanded)
+            echoerr 'Đường dẫn không tồn tại: ' . l:expanded . ' (có thể gõ nhầm path)'
+        else
+            echoerr 'Không có file khớp / thư mục rỗng: ' . l:expanded
+        endif
+        return
+    endif
+
+    let l:pat = s:DocxUploadAcceptPattern()
+    " Lọc trước: chỉ giữ file (không phải dir, readable). Phân loại accept
+    " để báo cáo; nhưng việc kiểm extension hỗ trợ để binary quyết (uploadmany
+    " tự SKIP). Ở đây ta vẫn lọc readable + bỏ thư mục.
+    let l:files = []
+    let l:skipped_unsupported = []
+    for l:f in l:matches
+        if isdirectory(l:f) || !filereadable(l:f)
+            continue
+        endif
+        if l:f !~? l:pat
+            call add(l:skipped_unsupported, fnamemodify(l:f, ':t'))
+            continue
+        endif
+        call add(l:files, l:f)
+    endfor
+
+    if empty(l:files)
+        if !empty(l:skipped_unsupported)
+            echo 'Không upload được: ' . len(l:skipped_unsupported)
+                        \ . ' file không thuộc định dạng hỗ trợ'
+        else
+            echo 'Không có file hợp lệ để upload'
+        endif
+        return
+    endif
+
+    " 1 file -> dùng 'upload' đơn (báo gọn). Nhiều file -> 'uploadmany' để
+    " chỉ mở+ghi lại zip MỘT lần (nhanh hơn nhiều với hàng trăm ảnh).
+    if len(l:files) == 1
+        let l:result = s:DocxCmd('upload', l:files[0])
+        unlet! b:docx_zip_entries
+        if v:shell_error
+            echoerr join(l:result, "\n")
+            return
+        endif
+        echo 'Uploaded into DOCX as: ' . get(l:result, 0, fnamemodify(l:files[0], ':t'))
+        return
+    endif
+
+    " Ghi danh sách path ra file tạm, gọi uploadmany.
+    let l:tmp = tempname()
+    call writefile(l:files, l:tmp)
+    let l:result = s:DocxCmd('uploadmany', l:tmp)
+    call delete(l:tmp)
+    unlet! b:docx_zip_entries
+    if v:shell_error
+        echoerr join(l:result, "\n")
+        return
+    endif
+    " Parse report: mỗi dòng "OK\t...", "SKIP\t...", "ERR\t...".
+    let l:ok = 0
+    let l:skip = 0
+    let l:err = 0
+    let l:err_names = []
+    for l:line in l:result
+        if l:line =~# '^OK\t'
+            let l:ok += 1
+        elseif l:line =~# '^SKIP\t'
+            let l:skip += 1
+        elseif l:line =~# '^ERR\t'
+            let l:err += 1
+            call add(l:err_names, split(l:line, "\t")[1])
+        endif
+    endfor
+    let l:skip += len(l:skipped_unsupported)
+    let l:msg = 'Upload: ' . l:ok . ' thành công'
+    if l:skip > 0
+        let l:msg .= ', ' . l:skip . ' bỏ qua (không hỗ trợ)'
+    endif
+    if l:err > 0
+        let l:msg .= ', ' . l:err . ' lỗi'
+    endif
+    echo l:msg
+    if l:err > 0
+        echohl WarningMsg
+        echom 'Lỗi: ' . join(l:err_names, ', ')
+        echohl None
+    endif
+endfunction
+" ----------------------------------------------------------------------------
+" DocxUploadComplete(): completion cho :DocxUpload — gợi ý file hệ thống
+" (lọc chỉ hiện file accept + thư mục để duyệt sâu hơn).
+" ----------------------------------------------------------------------------
+function! DocxUploadComplete(A, L, P) abort
+    let l:candidates = getcompletion(a:A, 'file')
+    let l:pat = s:DocxUploadAcceptPattern()
+    return filter(l:candidates, 'isdirectory(v:val) || v:val =~? l:pat')
+endfunction
+" ----------------------------------------------------------------------------
+" s:DocxPackageFiles(): trả về list mọi file trong word/media/ và
+" word/embeddings/ (chỉ basename). Dùng cho completion :DocxInsertFile.
+" ----------------------------------------------------------------------------
+function! s:DocxPackageFiles() abort
+    if !exists('b:docx_file')
+        return []
+    endif
+    let l:result = s:DocxCmd('listzip')
+    if v:shell_error
+        return []
+    endif
+    let l:files = []
+    for l:line in l:result
+        let l:parts = split(l:line, "\t")
+        if len(l:parts) != 2
+            continue
+        endif
+        let l:entry = l:parts[1]
+        if l:entry =~? '^word/\(media\|embeddings\)/.\+'
+            call add(l:files, fnamemodify(l:entry, ':t'))
+        endif
+    endfor
+    return l:files
+endfunction
+" ----------------------------------------------------------------------------
+" s:DocxIsImageName(name): true nếu tên file là ảnh (theo extension).
+" ----------------------------------------------------------------------------
+function! s:DocxIsImageName(name) abort
+    return a:name =~? '\.\(png\|jpg\|jpeg\|gif\|bmp\|webp\|tif\|tiff\)$'
+endfunction
+" ----------------------------------------------------------------------------
+" DocxInsertFileComplete(): completion cho :DocxInsertFile — gợi ý tên
+" file có sẵn trong word/media/ + word/embeddings/.
+" ----------------------------------------------------------------------------
+function! DocxInsertFileComplete(A, L, P) abort
+    return filter(s:DocxPackageFiles(), 'v:val =~? a:A')
+endfunction
+" ----------------------------------------------------------------------------
+" DocxInsertFile(args): chèn 1 file đính kèm (CÓ SẴN trong package) vào
+" paragraph tại cursor. Cú pháp: :DocxInsertFile <tên_file> [width_cm]
+"   - Nếu là ẢNH: chèn inline image thật (width_cm = chiều rộng cm, mặc
+"     định 10; chiều cao tự co theo tỉ lệ).
+"   - Nếu là FILE KHÁC (pdf/docx/excel/zip/...): chèn marker "[📎 tên]"
+"     vào doc (an toàn, không đụng OLE). gx/:DocxOpen trên dòng đó để mở.
+" ----------------------------------------------------------------------------
+function! DocxInsertFile(args) abort
+    if !exists('b:docx_file')
+        echoerr 'This buffer is not a DOCX file'
+        return
+    endif
+    let l:pid = s:DocxParaIdAtCursor()
+    if empty(l:pid)
+        echoerr 'Cursor not on a paragraph (di chuyển con trỏ tới đoạn muốn chèn)'
+        return
+    endif
+    let l:parts = split(trim(a:args))
+    if empty(l:parts)
+        echoerr 'Usage: :DocxInsertFile <file-name> [width_cm (chỉ cho ảnh)]'
+        return
+    endif
+    " Phần tử cuối nếu là số -> width (chỉ dùng khi là ảnh). Còn lại ghép
+    " làm tên file (hỗ trợ tên có khoảng trắng).
+    let l:width = '10'
+    let l:name = ''
+    if len(l:parts) >= 2 && l:parts[-1] =~# '^\d\+\(\.\d\+\)\=$'
+        let l:width = l:parts[-1]
+        let l:name = join(l:parts[0:-2], ' ')
+    else
+        let l:name = join(l:parts, ' ')
+    endif
+    " Save trước nếu buffer đang sửa dở (thao tác trên file gốc qua binary).
+    if &modified
+        call DocxSave()
+        if &modified
+            return
+        endif
+    endif
+    if s:DocxIsImageName(l:name)
+        " Ảnh -> chèn inline image thật.
+        let l:result = s:DocxCmd('insertimage', l:pid, l:name, l:width)
+        if v:shell_error
+            echoerr join(l:result, "\n")
+            return
+        endif
+        call s:DocxLoadIntoBuffer(l:result)
+        set nomodified
+        echo 'Inserted image ' . l:name . ' (' . l:width . 'cm) into ' . l:pid
+    else
+        " File khác -> chèn marker đính kèm (an toàn).
+        let l:result = s:DocxCmd('insertfile', l:pid, l:name)
+        if v:shell_error
+            echoerr join(l:result, "\n")
+            return
+        endif
+        call s:DocxLoadIntoBuffer(l:result)
+        set nomodified
+        echo 'Inserted attachment marker [📎 ' . l:name . '] into ' . l:pid . ' (dùng gx để mở)'
+    endif
+endfunction
+" ----------------------------------------------------------------------------
+" s:DocxEmbeddableOOXML(): list file docx/xlsx/xlsm trong word/embeddings/
+" (basename) — nguồn cho :DocxInsertOLE.
+" ----------------------------------------------------------------------------
+function! s:DocxEmbeddableOOXML() abort
+    if !exists('b:docx_file')
+        return []
+    endif
+    let l:result = s:DocxCmd('listzip')
+    if v:shell_error
+        return []
+    endif
+    let l:files = []
+    for l:line in l:result
+        let l:parts = split(l:line, "\t")
+        if len(l:parts) == 2 && l:parts[1] =~? '^word/embeddings/.\+\.\(docx\|xlsx\|xlsm\)$'
+            call add(l:files, fnamemodify(l:parts[1], ':t'))
+        endif
+    endfor
+    return l:files
+endfunction
+function! DocxInsertOLEComplete(A, L, P) abort
+    return filter(s:DocxEmbeddableOOXML(), 'v:val =~? a:A')
+endfunction
+" ----------------------------------------------------------------------------
+" DocxInsertOLE(name): chèn OLE embedded object (docx/xlsx/xlsm CÓ SẴN
+" trong word/embeddings/) vào paragraph tại cursor, hiển thị dạng icon.
+" Mở được bằng double-click trong Word thật. Cú pháp: :DocxInsertOLE <tên>
+" ----------------------------------------------------------------------------
+function! DocxInsertOLE(name) abort
+    if !exists('b:docx_file')
+        echoerr 'This buffer is not a DOCX file'
+        return
+    endif
     let l:pid = s:DocxParaIdAtCursor()
     if empty(l:pid)
         echoerr 'Cursor not on a paragraph'
         return
     endif
-    let l:result = s:DocxCmd('extract', l:pid)
-    if v:shell_error
-        let l:msg = join(l:result, ' ')
-        if l:msg =~? 'no extractable media'
-            echo 'No image/object on this paragraph'
-        else
-            echoerr l:msg
-        endif
+    let l:nm = trim(a:name)
+    if empty(l:nm)
+        echoerr 'Usage: :DocxInsertOLE <docx-or-xlsx-name>'
         return
     endif
-    let l:opener = s:DocxSystemOpenCmd()
-    let l:has_xlsx = s:DocxHasXlsxPlugin()
-    for l:path in l:result
-        if empty(l:path)
-            continue
+    if l:nm !~? '\.\(docx\|xlsx\|xlsm\)$'
+        echoerr 'OLE embed chỉ hỗ trợ docx/xlsx/xlsm'
+        return
+    endif
+    if &modified
+        call DocxSave()
+        if &modified
+            return
         endif
-        if l:has_xlsx && s:DocxIsExcelFile(l:path)
-            execute 'tabnew ' . fnameescape(l:path)
-            echo 'Opened in Vim tab: ' . l:path
-            continue
-        endif
-        if s:DocxIsImageFile(l:path)
-            if g:docx_image_open_mode ==# 'term'
-                if !s:DocxRenderImageInTerm(l:path)
-                    echoerr 'Terminal does not support inline images. Install chafa or use g:docx_image_open_mode = "os"'
-                endif
-                continue
-            elseif g:docx_image_open_mode ==# 'auto'
-                if s:DocxRenderImageInTerm(l:path)
-                    continue
-                endif
+    endif
+    let l:result = s:DocxCmd('insertole', l:pid, l:nm)
+    if v:shell_error
+        echoerr join(l:result, "\n")
+        return
+    endif
+    call s:DocxLoadIntoBuffer(l:result)
+    set nomodified
+    echo 'Inserted OLE object ' . l:nm . ' into ' . l:pid
+endfunction
+" ----------------------------------------------------------------------------
+" DocxReplaceImage(args): thay 1 ảnh trong word/media/ bằng ảnh mới từ disk.
+" Cú pháp: :DocxReplaceImage <tên_ảnh_đích> <đường_dẫn_ảnh_mới>
+" GHI ĐÈ bytes, giữ tên + document.xml -> an toàn, ảnh mới hiển thị ngay.
+" ----------------------------------------------------------------------------
+function! DocxReplaceImage(args) abort
+    if !exists('b:docx_file')
+        echoerr 'This buffer is not a DOCX file'
+        return
+    endif
+    let l:parts = split(trim(a:args))
+    if len(l:parts) < 2
+        echoerr 'Usage: :DocxReplaceImage <target-image-name> <new-image-path>'
+        return
+    endif
+    " Phần tử ĐẦU = tên ảnh đích trong media; PHẦN CÒN LẠI = đường dẫn ảnh
+    " mới (ghép lại, hỗ trợ path có khoảng trắng).
+    let l:target = l:parts[0]
+    let l:src = expand(join(l:parts[1:], ' '))
+    if !filereadable(l:src)
+        echoerr 'New image not found or not readable: ' . l:src
+        return
+    endif
+    let l:result = s:DocxCmd('replaceimage', l:target, l:src)
+    if v:shell_error
+        echoerr join(l:result, "\n")
+        return
+    endif
+    call s:DocxLoadIntoBuffer(l:result)
+    set nomodified
+    echo 'Replaced image ' . l:target . ' with ' . fnamemodify(l:src, ':t')
+endfunction
+function! DocxReplaceImageComplete(A, L, P) abort
+    " Completion phần đầu: gợi ý ảnh trong media. (Phần path thứ 2 user tự gõ.)
+    return filter(s:DocxPackageFiles(), 'v:val =~? a:A')
+endfunction
+" ----------------------------------------------------------------------------
+" DocxResizeImage(args): chỉnh kích thước ảnh inline tại paragraph cursor.
+" Cú pháp:
+"   :DocxResizeImage fit          -> to ngang vùng nội dung trang
+"   :DocxResizeImage width 12     -> rộng 12cm, cao tự co theo tỉ lệ
+"   :DocxResizeImage height 8     -> cao 8cm, rộng tự co theo tỉ lệ
+" ----------------------------------------------------------------------------
+function! DocxResizeImage(args, ...) abort
+    if !exists('b:docx_file')
+        echoerr 'This buffer is not a DOCX file'
+        return
+    endif
+    " Range info (từ command): a:1=line1, a:2=line2, a:3=range (0 nếu không
+    " có range). Nếu có range -> gom MỌI para_id trong vùng để resize tất cả
+    " ảnh được chọn; ngược lại -> chỉ paragraph tại cursor.
+    let l:has_range = a:0 >= 3 && a:3 > 0
+    let l:pids = []
+    if l:has_range
+        let l:seen = {}
+        let l:lo = a:1 <= a:2 ? a:1 : a:2
+        let l:hi = a:1 <= a:2 ? a:2 : a:1
+        let l:ln = l:lo
+        while l:ln <= l:hi
+            let l:pid = s:DocxParaIdAtLine(l:ln)
+            if !empty(l:pid) && !has_key(l:seen, l:pid)
+                let l:seen[l:pid] = 1
+                call add(l:pids, l:pid)
             endif
+            let l:ln += 1
+        endwhile
+    else
+        let l:pid = s:DocxParaIdAtCursor()
+        if !empty(l:pid)
+            call add(l:pids, l:pid)
         endif
-        if has('win32') || has('win64')
-            silent! call system(l:opener . ' ' . shellescape(l:path))
-        else
-            call system(l:opener . ' ' . shellescape(l:path) . ' &')
+    endif
+    if empty(l:pids)
+        echoerr 'Không tìm thấy paragraph nào (đặt con trỏ/chọn vùng có ảnh)'
+        return
+    endif
+
+    let l:parts = split(trim(a:args))
+    if empty(l:parts)
+        echoerr 'Usage: :DocxResizeImage fit | width <cm> | height <cm>'
+        return
+    endif
+    let l:mode = tolower(l:parts[0])
+    if index(['fit', 'width', 'height'], l:mode) < 0
+        echoerr 'Mode phải là: fit | width | height'
+        return
+    endif
+    let l:value = ''
+    if l:mode !=# 'fit'
+        if len(l:parts) < 2
+            echoerr 'Mode "' . l:mode . '" cần giá trị cm. Vd: :DocxResizeImage ' . l:mode . ' 12'
+            return
         endif
-        echo 'Opened: ' . l:path
-    endfor
+        let l:value = l:parts[1]
+    endif
+    if &modified
+        call DocxSave()
+        if &modified
+            return
+        endif
+    endif
+    " Truyền danh sách para_id phân tách bằng dấu phẩy (binary resize tất cả
+    " ảnh inline trong mọi paragraph đó).
+    let l:result = s:DocxCmd('resizeimage', join(l:pids, ','), l:mode, l:value)
+    if v:shell_error
+        echoerr join(l:result, "\n")
+        return
+    endif
+    call s:DocxLoadIntoBuffer(l:result)
+    set nomodified
+    let l:scope = len(l:pids) > 1 ? (len(l:pids) . ' đoạn') : l:pids[0]
+    if l:mode ==# 'fit'
+        echo 'Resized images to page width (' . l:scope . ')'
+    else
+        echo 'Resized images: ' . l:mode . ' = ' . l:value . 'cm (' . l:scope . ')'
+    endif
+endfunction
+function! DocxResizeImageComplete(A, L, P) abort
+    " Completion mode ở từ đầu tiên.
+    let l:line_parts = split(a:L)
+    " Nếu đang gõ từ đầu tiên (mode) -> gợi ý mode.
+    if len(l:line_parts) <= 1 || (len(l:line_parts) == 2 && a:L !~# '\s$')
+        return filter(['fit', 'width', 'height'], 'v:val =~? a:A')
+    endif
+    return []
+endfunction
+" ----------------------------------------------------------------------------
+" DocxDeleteFile(entry): xóa 1 file trong package — CHỈ file chưa được đính
+" kèm/tham chiếu. Binary sẽ từ chối nếu file đang được dùng (an toàn).
+" Cú pháp: :DocxDeleteFile <tên_file_hoặc_entry>
+" ----------------------------------------------------------------------------
+function! DocxDeleteFile(entry) abort
+    if !exists('b:docx_file')
+        echoerr 'This buffer is not a DOCX file'
+        return
+    endif
+    let l:e = trim(a:entry)
+    if empty(l:e)
+        echoerr 'Usage: :DocxDeleteFile <file-name-or-entry>'
+        return
+    endif
+    " Xác nhận trước khi xóa (thao tác ghi đè file gốc).
+    if confirm('Xóa file "' . l:e . '" khỏi package?', "&Có\n&Không", 2) != 1
+        echo 'Đã hủy.'
+        return
+    endif
+    if &modified
+        call DocxSave()
+        if &modified
+            return
+        endif
+    endif
+    let l:result = s:DocxCmd('deletefile', l:e)
+    if v:shell_error
+        echoerr join(l:result, "\n")
+        return
+    endif
+    unlet! b:docx_zip_entries
+    call s:DocxLoadIntoBuffer(l:result)
+    set nomodified
+    echo 'Đã xóa: ' . l:e
+endfunction
+function! DocxDeleteFileComplete(A, L, P) abort
+    return filter(s:DocxPackageFiles(), 'v:val =~? a:A')
 endfunction
 " ----------------------------------------------------------------------------
 " LIST OPERATIONS
@@ -1305,7 +2077,15 @@ command! DocxListAdd call DocxListAdd()
 command! DocxListAddBefore call DocxListAddBefore()
 command! DocxListDel call DocxListDel()
 command! DocxListEnter call DocxListSmartEnter()
-command! DocxOpen call DocxOpenMedia()
+command! -range DocxOpen call <SID>DocxOpenCmd(<line1>, <line2>, <range>)
 command! DocxInfo call DocxHoverInfo()
+command! DocxListZip call DocxListZip()
+command! -range -nargs=1 -complete=customlist,DocxOpenFileComplete DocxOpenFile call DocxOpenFile(<q-args>)
+command! -range -nargs=+ -complete=customlist,DocxUploadComplete DocxUpload call DocxUpload(<q-args>)
+command! -range -nargs=+ -complete=customlist,DocxInsertFileComplete DocxInsertFile call DocxInsertFile(<q-args>)
+command! -range -nargs=1 -complete=customlist,DocxInsertOLEComplete DocxInsertOLE call DocxInsertOLE(<q-args>)
+command! -range -nargs=+ -complete=customlist,DocxReplaceImageComplete DocxReplaceImage call DocxReplaceImage(<q-args>)
+command! -range -nargs=+ -complete=customlist,DocxResizeImageComplete DocxResizeImage call DocxResizeImage(<q-args>, <line1>, <line2>, <range>)
+command! -range -nargs=1 -complete=customlist,DocxDeleteFileComplete DocxDeleteFile call DocxDeleteFile(<q-args>)
 command! -nargs=1 -complete=customlist,DocxGotoComplete DocxGoto call DocxGoto(<q-args>)
 command! -range DocxDebug call DocxDebug(<line1>, <line2>)

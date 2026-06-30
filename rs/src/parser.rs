@@ -340,6 +340,8 @@ fn parse_paragraph_body(
                             is_drawing: false,
                             rel_id: None,
                             byte_range: None,
+                    media_name: None,
+                        drawing_xml: None,
                         });
                         current_run_byte_start = Some(event_pos_before_inner);
                         current_has_drawing = false;
