@@ -265,42 +265,7 @@ fn cmd_create(path: &str) -> AppResult<()> {
 }
 
 fn cmd_open(path: &str) -> AppResult<()> {
-    let mut archive = zip_io::open_archive(path)?;
-    let xml = zip_io::read_entry(&mut archive, "word/document.xml")?;
-    let mut doc = parser::parse_document(&xml)?;
-    resolve_media_names(&mut doc, &mut archive);
-    let numbering = load_numbering(&mut archive);
-    let r = render::render(&doc, &numbering);
-    println!("{}", r.text);
-    println!("@@STYLE@@");
-    for (line, cs, ce, bold, italic, size_pt, color, font, highlight) in &r.style_meta {
-        let size_str = size_pt.map(|s| format!("{s}")).unwrap_or_else(|| "-".to_string());
-        let color_str = color.as_deref().unwrap_or("-");
-        let font_str = font.as_deref().unwrap_or("-");
-        let hl_str = highlight.as_deref().unwrap_or("-");
-        println!(
-            "{line}\t{cs}\t{ce}\t{b}\t{i}\t{size_str}\t{color_str}\t{font_str}\t{hl_str}",
-            b = *bold as u8,
-            i = *italic as u8,
-        );
-    }
-    println!("@@END@@");
-    println!("@@PARAMAP@@");
-    for (line, pid) in &r.para_map {
-        println!("{line}\t{pid}");
-    }
-    println!("@@PARAMAPEND@@");
-    println!("@@LISTINFO@@");
-    for (line, ilvl) in &r.list_info {
-        println!("{line}\t{ilvl}");
-    }
-    println!("@@LISTINFOEND@@");
-    println!("@@CELLMAP@@");
-    for (line, col, cs, ce, pid) in &r.cell_map {
-        println!("{line}\t{col}\t{cs}\t{ce}\t{pid}");
-    }
-    println!("@@CELLMAPEND@@");
-    Ok(())
+    emit_open_output(path)
 }
 
 fn cmd_save(path: &str, tmp_path: &str) -> AppResult<()> {
@@ -392,6 +357,11 @@ fn emit_open_output(path: &str) -> AppResult<()> {
         println!("{line}\t{col}\t{cs}\t{ce}\t{pid}");
     }
     println!("@@CELLMAPEND@@");
+    println!("@@PAGEBREAK@@");
+    for (line, page, estimated) in render::page_breaks(&doc, &r.para_map) {
+        println!("{line}\t{page}\t{}", estimated as u8);
+    }
+    println!("@@PAGEBREAKEND@@");
     Ok(())
 }
 
@@ -414,53 +384,10 @@ fn cmd_listadd(path: &str, para_id: &str, position: &str) -> AppResult<()> {
         .find(|p| p.id == para_id)
         .ok_or_else(|| AppError(format!("Paragraph not found: {para_id}")))?;
 
-    // Build pPr inner cho paragraph mới — kế thừa MỌI thuộc tính paragraph
-    // từ source (numPr, indent, alignment, pStyle nếu là list style):
-    let mut ppr_inner = String::new();
-    // pStyle: kế thừa cho list style HOẶC heading (để dòng mới giữ cùng style)
-    if let Some(style) = &src.para_style {
-        if style.starts_with("List") || style.starts_with("Heading") || style == "Title" {
-            ppr_inner.push_str(&format!("<w:pStyle w:val=\"{style}\"/>"));
-        }
-    }
-    // numPr: kế thừa cho list item (inline numbering)
-    if let Some(num_id) = src.num_id {
-        let ilvl = src.num_ilvl.unwrap_or(0);
-        ppr_inner.push_str(&format!(
-            "<w:numPr><w:ilvl w:val=\"{ilvl}\"/><w:numId w:val=\"{num_id}\"/></w:numPr>"
-        ));
-    } else if let Some(ilvl) = src.num_ilvl {
-        ppr_inner.push_str(&format!("<w:numPr><w:ilvl w:val=\"{ilvl}\"/></w:numPr>"));
-    }
-    // indent: kế thừa nếu source có
-    if let Some(ind) = src.indent_twips {
-        if ind != 0 {
-            ppr_inner.push_str(&format!("<w:ind w:left=\"{ind}\"/>"));
-        }
-    }
-    // alignment: kế thừa căn lề
-    if let Some(jc) = &src.alignment {
-        ppr_inner.push_str(&format!("<w:jc w:val=\"{jc}\"/>"));
-    }
-
-    // Kế thừa style của FIRST RUN (bold/italic/font/color/size/highlight)
-    // cho paragraph mới — nếu dòng cũ in đậm thì dòng mới cũng đậm.
-    let rpr_inner = build_first_run_rpr(src);
-    let run_xml = if rpr_inner.is_empty() {
-        String::new()
-    } else {
-        format!("<w:r><w:rPr>{rpr_inner}</w:rPr></w:r>")
-    };
-
-    let new_para_xml = if ppr_inner.is_empty() && run_xml.is_empty() {
-        "<w:p/>".to_string()
-    } else if run_xml.is_empty() {
-        format!("<w:p><w:pPr>{ppr_inner}</w:pPr></w:p>")
-    } else if ppr_inner.is_empty() {
-        format!("<w:p>{run_xml}</w:p>")
-    } else {
-        format!("<w:p><w:pPr>{ppr_inner}</w:pPr>{run_xml}</w:p>")
-    };
+    // Dòng mới kế thừa thuộc tính paragraph và style chữ của dòng nguồn.
+    let rpr = xml_emit::inherited_rpr(src);
+    let run_xml = if rpr.is_empty() { rpr } else { format!("<w:r>{rpr}</w:r>") };
+    let new_para_xml = format!("<w:p>{}{run_xml}</w:p>", xml_emit::inherited_ppr(src, true));
 
     // Chèn vào XML gốc: TRƯỚC <w:p> của source (position=before) hoặc
     // SAU </w:p> của source (position=after, mặc định).
@@ -478,39 +405,6 @@ fn cmd_listadd(path: &str, para_id: &str, position: &str) -> AppResult<()> {
     emit_open_output(path)
 }
 
-/// Build rPr nội dung XML từ style của run đầu tiên của paragraph nguồn.
-/// Dùng cho listadd để dòng mới kế thừa font/bold/italic/color.
-fn build_first_run_rpr(src: &model::Paragraph) -> String {
-    let first = src.runs.iter().find(|r| !r.is_drawing);
-    let first = match first {
-        Some(r) if !r.style.is_default() => r,
-        _ => return String::new(),
-    };
-    let mut s = String::new();
-    if let Some(font) = &first.style.font_name {
-        s.push_str(&format!(
-            "<w:rFonts w:ascii=\"{f}\" w:hAnsi=\"{f}\" w:cs=\"{f}\"/>",
-            f = font
-        ));
-    }
-    if first.style.bold {
-        s.push_str("<w:b/>");
-    }
-    if first.style.italic {
-        s.push_str("<w:i/>");
-    }
-    if let Some(sz) = first.style.size_half_pt {
-        s.push_str(&format!("<w:sz w:val=\"{sz}\"/><w:szCs w:val=\"{sz}\"/>"));
-    }
-    if let Some(color) = &first.style.color_hex {
-        s.push_str(&format!("<w:color w:val=\"{color}\"/>"));
-    }
-    if let Some(hl) = &first.style.highlight {
-        s.push_str(&format!("<w:highlight w:val=\"{hl}\"/>"));
-    }
-    s
-}
-
 fn cmd_listdel(path: &str, para_id: &str) -> AppResult<()> {
     let mut archive = zip_io::open_archive(path)?;
     let xml = zip_io::read_entry(&mut archive, "word/document.xml")?;
@@ -521,6 +415,16 @@ fn cmd_listdel(path: &str, para_id: &str) -> AppResult<()> {
         .iter()
         .find(|p| p.id == para_id)
         .ok_or_else(|| AppError(format!("Paragraph not found: {para_id}")))?;
+
+    if let model::ParaContext::TableCell { row_idx, col_idx, .. } = target.context {
+        let before = &xml[..target.byte_range.0];
+        let after = &xml[target.byte_range.1..];
+        let alone = String::from_utf8_lossy(before).trim_end().ends_with("</w:tcPr>")
+            || String::from_utf8_lossy(before).trim_end().ends_with("<w:tc>");
+        if alone && String::from_utf8_lossy(after).trim_start().starts_with("</w:tc>") {
+            return Err(AppError(format!("Cannot delete the only paragraph of cell ({row_idx},{col_idx})")));
+        }
+    }
 
     // Xoá đoạn byte_range của paragraph khỏi XML gốc.
     let mut new_xml: Vec<u8> = Vec::with_capacity(xml.len());
@@ -1775,7 +1679,6 @@ fn cmd_resizeimage(path: &str, para_ids: &str, mode: &str, value: &str) -> AppRe
                 resize_one_drawing(&cur_xml, &mode, value_cm, content_w_emu, ratio_override)
             {
                 run.drawing_xml = Some(new_xml);
-                run.byte_range = None;
                 para_changed = true;
                 resized += 1;
             }
@@ -2035,143 +1938,52 @@ fn parse_rels(xml: &[u8]) -> std::collections::HashMap<String, String> {
     map
 }
 
+/// Áp `change` lên mọi run; paragraph rỗng thì tạo 1 run giữ style (để dòng
+/// chưa có chữ vẫn nhận font/màu).
+fn set_runs(p: &mut model::Paragraph, change: impl Fn(&mut model::RunStyle)) {
+    if p.runs.is_empty() {
+        let mut style = model::RunStyle::default();
+        change(&mut style);
+        if !style.is_default() {
+            p.runs.push(model::Run { style, ..Default::default() });
+        }
+    }
+    for r in p.runs.iter_mut() {
+        change(&mut r.style);
+    }
+}
+
 fn apply_style_attr(p: &mut model::Paragraph, attr: &str, value: &str) -> AppResult<()> {
     match attr {
         "togglebold" => {
-            if p.runs.is_empty() {
-                p.runs.push(model::Run {
-                    text: String::new(),
-                    style: model::RunStyle { bold: true, ..Default::default() },
-                    is_drawing: false,
-                    rel_id: None,
-                    byte_range: None,
-            media_name: None,
-                drawing_xml: None,
-                });
-            } else {
-                let any_not_bold = p.runs.iter().any(|r| !r.style.bold);
-                for r in p.runs.iter_mut() {
-                    r.style.bold = any_not_bold;
-                }
-            }
+            let on = p.runs.is_empty() || p.runs.iter().any(|r| !r.style.bold);
+            set_runs(p, |s| s.bold = on);
         }
         "toggleitalic" => {
-            if p.runs.is_empty() {
-                p.runs.push(model::Run {
-                    text: String::new(),
-                    style: model::RunStyle { italic: true, ..Default::default() },
-                    is_drawing: false,
-                    rel_id: None,
-                    byte_range: None,
-            media_name: None,
-                drawing_xml: None,
-                });
-            } else {
-                let any_not_italic = p.runs.iter().any(|r| !r.style.italic);
-                for r in p.runs.iter_mut() {
-                    r.style.italic = any_not_italic;
-                }
-            }
+            let on = p.runs.is_empty() || p.runs.iter().any(|r| !r.style.italic);
+            set_runs(p, |s| s.italic = on);
         }
         "size" => {
             let pt: f32 = value
                 .parse()
                 .map_err(|_| AppError(format!("Invalid size: {value}")))?;
             let half = (pt * 2.0).round() as u32;
-            if p.runs.is_empty() {
-                p.runs.push(model::Run {
-                    text: String::new(),
-                    style: model::RunStyle { size_half_pt: Some(half), ..Default::default() },
-                    is_drawing: false,
-                    rel_id: None,
-                    byte_range: None,
-            media_name: None,
-                drawing_xml: None,
-                });
-            } else {
-                for r in p.runs.iter_mut() {
-                    r.style.size_half_pt = Some(half);
-                }
-            }
+            set_runs(p, |s| s.size_half_pt = Some(half));
         }
         "color" => {
             let v = parse_color(value)?;
-            if p.runs.is_empty() && v.is_some() {
-                p.runs.push(model::Run {
-                    text: String::new(),
-                    style: model::RunStyle { color_hex: v.clone(), ..Default::default() },
-                    is_drawing: false,
-                    rel_id: None,
-                    byte_range: None,
-            media_name: None,
-                drawing_xml: None,
-                });
-            } else {
-                for r in p.runs.iter_mut() {
-                    r.style.color_hex = v.clone();
-                }
-            }
+            set_runs(p, |s| s.color_hex = v.clone());
         }
         "highlight" => {
-            // Highlight value: tên màu chuẩn ("yellow", "green", "cyan",
-            // "magenta", "blue", "red", "darkBlue", "darkCyan", "darkGreen",
-            // "darkMagenta", "darkRed", "darkYellow", "darkGray",
-            // "lightGray", "black", "white", "none"). DOCX nhận chính các
-            // tên này cho <w:highlight>.
-            let lower = value.trim().to_lowercase();
-            let v = if lower == "none" {
-                None
-            } else {
-                Some(value.trim().to_string())
-            };
-            if p.runs.is_empty() && v.is_some() {
-                p.runs.push(model::Run {
-                    text: String::new(),
-                    style: model::RunStyle { highlight: v.clone(), ..Default::default() },
-                    is_drawing: false,
-                    rel_id: None,
-                    byte_range: None,
-            media_name: None,
-                drawing_xml: None,
-                });
-            } else {
-                for r in p.runs.iter_mut() {
-                    r.style.highlight = v.clone();
-                }
-            }
+            // Tên màu chuẩn của <w:highlight> ("yellow", "darkBlue"...).
+            let v = value.trim();
+            let v = (!v.eq_ignore_ascii_case("none")).then(|| v.to_string());
+            set_runs(p, |s| s.highlight = v.clone());
         }
         "font" => {
-            // Font name — bất kỳ string nào, vd "Times New Roman",
-            // "Roboto", "Arial". Word sẽ render bằng font đó nếu hệ thống
-            // có cài, hoặc fallback.
             let v = value.trim();
-            let opt = if v.is_empty() || v.eq_ignore_ascii_case("none") {
-                None
-            } else {
-                Some(v.to_string())
-            };
-            // Nếu paragraph KHÔNG có run nào (empty paragraph, vd dòng
-            // mới insert chưa gõ text), tạo placeholder run với font
-            // mới — để emit_paragraph có chỗ gắn rFonts. Đảm bảo
-            // Word render với font đúng kể cả khi paragraph empty.
-            if p.runs.is_empty() && opt.is_some() {
-                p.runs.push(model::Run {
-                    text: String::new(),
-                    style: model::RunStyle {
-                        font_name: opt.clone(),
-                        ..Default::default()
-                    },
-                    is_drawing: false,
-                    rel_id: None,
-                    byte_range: None,
-            media_name: None,
-                drawing_xml: None,
-                });
-            } else {
-                for r in p.runs.iter_mut() {
-                    r.style.font_name = opt.clone();
-                }
-            }
+            let v = (!v.is_empty() && !v.eq_ignore_ascii_case("none")).then(|| v.to_string());
+            set_runs(p, |s| s.font_name = v.clone());
         }
         "indent" => {
             // Indent: value là số nguyên cấp (-N hoặc +N), tăng/giảm theo

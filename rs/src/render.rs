@@ -18,7 +18,7 @@ use std::collections::HashMap;
 /// Sinh placeholder text cho 1 drawing run. Nếu có media_name (resolve
 /// được từ rels) -> "[IMAGE: ten_file.png]"; nếu không -> "[IMAGE]"
 /// (fallback an toàn khi rels không đọc được hoặc rel_id không match).
-fn image_placeholder(run: &Run) -> String {
+pub fn image_placeholder(run: &Run) -> String {
     match &run.media_name {
         Some(name) => format!("[IMAGE: {name}]"),
         None => "[IMAGE]".to_string(),
@@ -43,6 +43,59 @@ pub struct Rendered {
     /// char_start/char_end là vùng text của cell (giữa các `│`).
     /// Save logic dùng để map text edit user gõ → đúng paragraph cell.
     pub cell_map: Vec<(usize, u32, usize, usize, String)>,
+}
+
+/// Dòng buffer nào mở đầu trang mới: (line, số trang, là ước lượng?).
+/// Ngắt chủ động (\f, pageBreakBefore, section break) luôn đúng. Ngắt tự
+/// động lấy từ lastRenderedPageBreak của Word; file không có thì ước lượng.
+/// ponytail: ước lượng theo số ký tự, không phải layout engine; chỉnh CHAR_TW
+/// / PARA_GAP_TW nếu lệch.
+pub fn page_breaks(doc: &Document, para_map: &[(usize, String)]) -> Vec<(usize, u32, bool)> {
+    const CHAR_TW: f32 = 10.0; // twips mỗi ký tự trên mỗi point cỡ chữ
+    const PARA_GAP_TW: f32 = 120.0;
+    let xml = String::from_utf8_lossy(&doc.original_xml);
+    let num = |tag: &str, attr: &str, default: f32| -> f32 {
+        xml.rfind(tag)
+            .and_then(|a| {
+                let e = &xml[a..a + xml[a..].find('>')?];
+                let key = format!(" {attr}=\"");
+                let v = &e[e.find(&key)? + key.len()..];
+                v[..v.find('"')?].parse().ok()
+            })
+            .unwrap_or(default)
+    };
+    let width = num("<w:pgSz", "w:w", 11906.0) - num("<w:pgMar", "w:left", 1440.0) - num("<w:pgMar", "w:right", 1440.0);
+    let height = num("<w:pgSz", "w:h", 16838.0) - num("<w:pgMar", "w:top", 1440.0) - num("<w:pgMar", "w:bottom", 1440.0);
+    let has_rendered = xml.contains("<w:lastRenderedPageBreak");
+
+    let by_id: HashMap<&str, &Paragraph> = doc.paragraphs.iter().map(|p| (p.id.as_str(), p)).collect();
+    let mut out = Vec::new();
+    let mut page = 1u32;
+    let mut used = 0f32;
+    let mut pending = false;
+    for (line, pid) in para_map {
+        let Some(p) = by_id.get(pid.as_str()) else { continue };
+        let raw = String::from_utf8_lossy(&doc.original_xml[p.byte_range.0..p.byte_range.1]);
+        let text: String = p.runs.iter().map(|r| r.text.as_str()).collect();
+        let size = p.runs.iter().filter_map(|r| r.style.size_half_pt).max().unwrap_or(22) as f32 / 2.0;
+        let rows = (text.chars().count() as f32 * size * CHAR_TW / width.max(1.0)).ceil().max(1.0);
+        let h = rows * size * 24.0 + PARA_GAP_TW;
+
+        let explicit = pending
+            || text.starts_with('\u{000C}')
+            || raw.contains("<w:pageBreakBefore/>")
+            || raw.contains("<w:lastRenderedPageBreak");
+        let estimated = !explicit && !has_rendered && used + h > height;
+        if (explicit || estimated) && *line > 1 && used > 0.0 {
+            page += 1;
+            used = 0.0;
+            out.push((*line, page, estimated));
+        }
+        used += h;
+        pending = (text.contains('\u{000C}') && !text.starts_with('\u{000C}'))
+            || (raw.contains("<w:sectPr") && !raw.contains("w:val=\"continuous\""));
+    }
+    out
 }
 
 /// Render content của 1 cell (paragraph trong TableCell) ra string với
@@ -195,12 +248,7 @@ pub fn render(
     let mut counters: std::collections::HashMap<String, Vec<u32>> =
         std::collections::HashMap::new();
     for p in &doc.paragraphs {
-        let is_list = p.num_id.is_some()
-            || p.num_ilvl.is_some()
-            || p.para_style
-                .as_deref()
-                .map(|s| s.starts_with("List"))
-                .unwrap_or(false);
+        let is_list = p.is_list();
         if !is_list {
             ordinals.push(String::new());
             continue;
@@ -340,18 +388,13 @@ pub fn render(
                 in_table_depth = 0;
                 current_table_start_for_render = None;
             }
-            let is_list = p.num_id.is_some()
-                || p.num_ilvl.is_some()
-                || p.para_style
-                    .as_deref()
-                    .map(|s| s.starts_with("List"))
-                    .unwrap_or(false);
+            let is_list = p.is_list();
             if is_list {
                 list_info.push((buffer_line, p.num_ilvl.unwrap_or(0)));
             }
             let ordinal = &ordinals[i];
             render_paragraph(
-                p, ordinal, &[], &mut out, &mut buffer_line, &mut style_meta, &mut para_map,
+                p, ordinal, &mut out, &mut buffer_line, &mut style_meta, &mut para_map,
             );
             i += 1;
             continue;
@@ -436,12 +479,7 @@ pub fn render(
                     if line_para_id.is_none() {
                         line_para_id = Some(p_cell.id.clone());
                     }
-                    let is_list_c = p_cell.num_id.is_some()
-                        || p_cell.num_ilvl.is_some()
-                        || p_cell.para_style
-                            .as_deref()
-                            .map(|s| s.starts_with("List"))
-                            .unwrap_or(false);
+                    let is_list_c = p_cell.is_list();
                     if is_list_c {
                         list_info.push((buffer_line, p_cell.num_ilvl.unwrap_or(0)));
                     }
@@ -508,10 +546,10 @@ pub fn render(
     }
 }
 
+/// Render 1 paragraph NGOÀI table (table render theo row ở `render`).
 fn render_paragraph(
     p: &Paragraph,
     ordinal: &str,
-    col_widths: &[usize],
     out: &mut String,
     buffer_line: &mut usize,
     style_meta: &mut Vec<(
@@ -520,115 +558,6 @@ fn render_paragraph(
     )>,
     para_map: &mut Vec<(usize, String)>,
 ) {
-    // Render TableCell as grid row: "│ <padding to col 0> │ <text> │ <padding to col N> │"
-    // Mọi paragraph trong cell có cùng (col_idx, row_idx); paragraph thứ 2+
-    // trong cell render ở dòng riêng nhưng vẫn align cùng cột.
-    if let ParaContext::TableCell { col_idx, .. } = &p.context {
-        let ci = *col_idx as usize;
-        out.push('│');
-        // Emit empty cells trước col của paragraph
-        for k in 0..ci {
-            let w = col_widths.get(k).copied().unwrap_or(4);
-            out.push(' ');
-            for _ in 0..w {
-                out.push(' ');
-            }
-            out.push(' ');
-            out.push('│');
-        }
-        // Cell chứa paragraph: " <text padded to w> │"
-        out.push(' ');
-        let cell_width = col_widths.get(ci).copied().unwrap_or(4);
-        // Tính prefix (ordinal/indent/style) + text
-        let mut cell_content = String::new();
-        // Indent
-        let indent_level = p
-            .indent_twips
-            .map(|t| (t.max(0) / 720) as usize)
-            .unwrap_or(0);
-        for _ in 0..indent_level {
-            cell_content.push_str("  ");
-        }
-    // List prefix: ordinal đã chứa cả punctuation từ numbering template
-    // (vd "1.", "•", "a)"). Chỉ thêm space sau.
-    if !ordinal.is_empty() {
-        cell_content.push_str(ordinal);
-        cell_content.push(' ');
-    } else if let Some(sty) = p.para_style.as_deref() {
-        if sty.starts_with("ListBullet") {
-            cell_content.push_str("• ");
-        }
-    }
-        // Text content
-        let prefix_chars_in_cell = cell_content.chars().count();
-        let text_start_byte_in_out = out.len();
-        out.push_str(&cell_content);
-        // Track style ranges
-        let cell_text_start_char_in_line = char_count_after_last_newline(out);
-        let mut char_cursor_in_cell = prefix_chars_in_cell;
-        for run in &p.runs {
-            if run.is_drawing {
-                let placeholder = image_placeholder(run);
-                let cstart = cell_text_start_char_in_line - prefix_chars_in_cell + char_cursor_in_cell + 1;
-                let cend = cstart + placeholder.chars().count() - 1;
-                if !run.style.is_default() {
-                    let size_pt = run.style.size_half_pt.map(|h| h as f32 / 2.0);
-                    style_meta.push((
-                        *buffer_line, cstart, cend,
-                        run.style.bold, run.style.italic, size_pt,
-                        run.style.color_hex.clone(),
-                        run.style.font_name.clone(),
-                        run.style.highlight.clone(),
-                    ));
-                }
-                out.push_str(&placeholder);
-                char_cursor_in_cell += placeholder.chars().count();
-                continue;
-            }
-            let run_len = run.text.chars().count();
-            if run_len == 0 {
-                continue;
-            }
-            if !run.style.is_default() {
-                let cstart = cell_text_start_char_in_line - prefix_chars_in_cell + char_cursor_in_cell + 1;
-                let cend = cstart + run_len - 1;
-                let size_pt = run.style.size_half_pt.map(|h| h as f32 / 2.0);
-                style_meta.push((
-                    *buffer_line, cstart, cend,
-                    run.style.bold, run.style.italic, size_pt,
-                    run.style.color_hex.clone(),
-                    run.style.font_name.clone(),
-                    run.style.highlight.clone(),
-                ));
-            }
-            out.push_str(&run.text);
-            char_cursor_in_cell += run_len;
-        }
-        let _ = text_start_byte_in_out;
-        // Pad text to cell_width
-        let actual_text_chars = char_cursor_in_cell;
-        let pad = cell_width.saturating_sub(actual_text_chars);
-        for _ in 0..pad {
-            out.push(' ');
-        }
-        out.push(' ');
-        out.push('│');
-        // Emit empty cells sau col của paragraph
-        for k in (ci + 1)..col_widths.len() {
-            let w = col_widths.get(k).copied().unwrap_or(4);
-            out.push(' ');
-            for _ in 0..w {
-                out.push(' ');
-            }
-            out.push(' ');
-            out.push('│');
-        }
-        para_map.push((*buffer_line, p.id.clone()));
-        out.push('\n');
-        *buffer_line += 1;
-        return;
-    }
-
     // Non-table paragraph: original render flow + alignment padding
     let context_prefix = match &p.context {
         ParaContext::Sdt => "┊ ",
@@ -749,13 +678,4 @@ fn render_paragraph(
     para_map.push((*buffer_line, p.id.clone()));
     out.push('\n');
     *buffer_line += 1;
-}
-
-/// Đếm số ký tự từ ký tự `\n` cuối cùng (hoặc đầu chuỗi) đến hết `s`.
-/// Dùng để xác định vị trí char start của text cell trong dòng buffer.
-fn char_count_after_last_newline(s: &str) -> usize {
-    match s.rfind('\n') {
-        Some(idx) => s[idx + 1..].chars().count(),
-        None => s.chars().count(),
-    }
 }

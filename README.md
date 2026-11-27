@@ -14,7 +14,8 @@ No Microsoft Word, LibreOffice, WPS Office, Python, Java, or OpenXML SDK is requ
 
 * Open `.docx` files directly inside Vim or Neovim
 * Save changes back to the original document
-* Automatic reload after every save
+* Save updates the buffer in place (cursor and scroll position stay)
+* Page separators (`═` explicit/Word break, `┄ ~N` estimated); display only
 * Automatic first-time Rust build
 * Pure Rust backend
 * Automatic override of Vim's built-in `zip.vim` support for DOCX files
@@ -28,7 +29,7 @@ No Microsoft Word, LibreOffice, WPS Office, Python, Java, or OpenXML SDK is requ
 * Delete paragraphs
 * Automatic paragraph insertion
 * Preserve paragraph formatting when inserting new content
-* Automatic document reformatting after every save
+* Edits patch only the changed text; other XML (links, underline, fields...) is kept
 
 ### Paragraph Navigation
 
@@ -150,7 +151,7 @@ No Microsoft Word, LibreOffice, WPS Office, Python, Java, or OpenXML SDK is requ
 | Read DOCX                    | ✓      |
 | Write DOCX                   | ✓      |
 | Automatic Build              | ✓      |
-| Automatic Reload             | ✓      |
+| In-place Refresh             | ✓      |
 | Paragraph Navigation         | ✓      |
 | Paragraph Statusline         | ✓      |
 | Hover Formatting Information | ✓      |
@@ -250,6 +251,10 @@ No Microsoft Word, LibreOffice, WPS Office, Python, Java, or OpenXML SDK is requ
 * Comments are preserved but cannot be edited.
 * Track Changes is not supported.
 * Extremely complex Word layouts may not render identically to Microsoft Word.
+* Automatic page breaks come from Word's cached pagination, otherwise they are estimated.
+* Soft line break, page break and column break show as `<2028>`, `^L`, `^K`; keep them to keep the break.
+* New lines cannot be typed inside a table (use `o`); the save is refused instead of dropping text.
+* Run `cargo test --release` in `rs/` for the round-trip checks.
 
 ---
 

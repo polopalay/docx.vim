@@ -10,7 +10,7 @@
 //! Minimal-diff save: paragraph chưa sửa copy nguyên byte gốc qua
 //! byte_range; paragraph dirty mới re-emit XML.
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct Run {
     pub text: String,
     pub style: RunStyle,
@@ -135,6 +135,15 @@ pub struct Document {
 pub enum InsertPosition {
     Before,
     After,
+}
+
+impl Paragraph {
+    /// List item: numbering inline hoặc theo style "List*".
+    pub fn is_list(&self) -> bool {
+        self.num_id.is_some()
+            || self.num_ilvl.is_some()
+            || self.para_style.as_deref().is_some_and(|s| s.starts_with("List"))
+    }
 }
 
 impl ParaContext {

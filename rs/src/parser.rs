@@ -296,6 +296,26 @@ fn parse_paragraph_body(
         // của run.
         let event_pos_before_inner = reader.buffer_position();
         let evt = reader.read_event_into(buf)?;
+        // Bên trong drawing/pict/object (kể cả textbox có <w:p>/<w:r> lồng):
+        // chỉ lấy rel_id, không đụng state của paragraph/run ngoài.
+        if drawing_depth > 0 {
+            match &evt {
+                Event::Start(e) | Event::Empty(e) => {
+                    if matches!(local_name(e.name().as_ref()), b"blip" | b"imagedata" | b"OLEObject") {
+                        if let Some(v) = attr_val(e, b"r:embed").or_else(|| attr_val(e, b"r:id")) {
+                            current_rel_id = Some(v);
+                        }
+                    }
+                    if matches!(evt, Event::Start(_)) {
+                        drawing_depth += 1;
+                    }
+                }
+                Event::End(_) => drawing_depth -= 1,
+                Event::Eof => return Err(AppError("EOF inside <w:p>".to_string())),
+                _ => {}
+            }
+            continue;
+        }
         match evt {
             Event::Start(e) => {
                 let local = local_name(e.name().as_ref()).to_vec();
@@ -357,23 +377,9 @@ fn parse_paragraph_body(
                     b"drawing" | b"pict" | b"object" => {
                         current_has_drawing = true;
                         drawing_depth += 1;
+                        depth -= 1; // End tương ứng được nuốt ở nhánh drawing
                     }
-                    b"blip" | b"imagedata" | b"OLEObject" if drawing_depth > 0 => {
-                        // <a:blip r:embed="rId4"/> hoặc <v:imagedata r:id=".."/>
-                        // hoặc <o:OLEObject r:id=".."/>. Lấy rel_id để map
-                        // sang file media qua document.xml.rels.
-                        let v = attr_val(&e, b"r:embed")
-                            .or_else(|| attr_val(&e, b"r:id"));
-                        if let Some(rid) = v {
-                            current_rel_id = Some(rid);
-                        }
-                        drawing_depth += 1;
-                    }
-                    _ => {
-                        if drawing_depth > 0 {
-                            drawing_depth += 1;
-                        }
-                    }
+                    _ => {}
                 }
             }
             Event::Empty(e) => {
@@ -419,22 +425,19 @@ fn parse_paragraph_body(
                     }
                     b"br" => {
                         if let Some(run) = current_run.as_mut() {
-                            run.text.push('\u{2028}');
-                        }
-                    }
-                    b"blip" | b"imagedata" | b"OLEObject" if drawing_depth > 0 => {
-                        // Self-closing variant của image relationship tag.
-                        let v = attr_val(&e, b"r:embed")
-                            .or_else(|| attr_val(&e, b"r:id"));
-                        if let Some(rid) = v {
-                            current_rel_id = Some(rid);
+                            let c = match attr_val(&e, b"w:type").as_deref() {
+                                Some("page") => '\u{000C}',
+                                Some("column") => '\u{000B}',
+                                _ => '\u{2028}',
+                            };
+                            run.text.push(c);
                         }
                     }
                     _ => {}
                 }
             }
             Event::Text(t) => {
-                if in_text && drawing_depth == 0 {
+                if in_text {
                     text_buf.push_str(&t.unescape()?.into_owned());
                 }
             }
@@ -452,23 +455,13 @@ fn parse_paragraph_body(
                             text_buf.clear();
                         }
                     }
-                    b"drawing" | b"pict" | b"object" => {
-                        if drawing_depth > 0 {
-                            drawing_depth -= 1;
-                        }
-                    }
                     b"r" => {
                         if let Some(mut run) = current_run.take() {
                             run.is_drawing = current_has_drawing;
                             run.rel_id = current_rel_id.take();
-                            // Set byte_range chỉ cho drawing run — để khi
-                            // emit paragraph dirty, copy nguyên byte XML
-                            // gốc của <w:r>...<w:drawing/>...</w:r>.
-                            if run.is_drawing {
-                                let end = reader.buffer_position();
-                                if let Some(start) = current_run_byte_start {
-                                    run.byte_range = Some((start, end));
-                                }
+                            // byte_range: emit paragraph dirty vá đúng đoạn này.
+                            if let Some(start) = current_run_byte_start {
+                                run.byte_range = Some((start, reader.buffer_position()));
                             }
                             current_run_byte_start = None;
                             current_has_drawing = false;
@@ -495,11 +488,7 @@ fn parse_paragraph_body(
                         doc.paragraphs.push(para);
                         return Ok(());
                     }
-                    _ => {
-                        if drawing_depth > 0 {
-                            drawing_depth -= 1;
-                        }
-                    }
+                    _ => {}
                 }
                 if depth <= 0 {
                     return Err(AppError(
@@ -512,6 +501,17 @@ fn parse_paragraph_body(
             }
             _ => {}
         }
+    }
+}
+
+/// Ký tự buffer tương ứng với 1 element <w:br .../>.
+pub fn break_char(xml: &str) -> char {
+    if xml.contains("w:type=\"page\"") {
+        '\u{000C}'
+    } else if xml.contains("w:type=\"column\"") {
+        '\u{000B}'
+    } else {
+        '\u{2028}'
     }
 }
 
